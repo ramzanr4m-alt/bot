@@ -110,43 +110,57 @@ async function updateGroupsList() {
   return groupsCache;
 }
 
-// Подключение к WhatsApp
+// Подключение к WhatsApp с корректным ожиданием сокета
 async function connectToWhatsApp(chatId = null, phoneNumber = null) {
+  // Закрываем предыдущий сокет, если он существовал
+  if (waSock) {
+    try {
+      waSock.end();
+    } catch (e) {}
+    waSock = null;
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
   waSock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: Browsers.ubuntu('Chrome')
+    browser: Browsers.ubuntu('Chrome'),
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 10000
   });
 
   waSock.ev.on('creds.update', saveCreds);
 
-  // Запрос кода сопряжения, если передан номер телефона
-  if (phoneNumber && !waSock.authState.creds.registered) {
-    setTimeout(async () => {
-      try {
-        const cleanPhone = phoneNumber.replace(/\D/g, '');
-        const code = await waSock.requestPairingCode(cleanPhone);
-        const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
-        if (chatId) {
-          bot.sendMessage(
-            chatId,
-            `🔑 Ваш код для входа в WhatsApp:\n\n*${formattedCode}*\n\nОткройте WhatsApp -> Связанные устройства -> Привязка устройства -> Вход по номеру телефона.`,
-            { parse_mode: 'Markdown' }
-          );
-        }
-      } catch (err) {
-        if (chatId) {
-          bot.sendMessage(chatId, `❌ Ошибка получения кода: ${err.message}. Проверьте правильность номера.`);
-        }
-      }
-    }, 3000);
-  }
+  let pairingRequested = false;
 
   waSock.ev.on('connection.update', async update => {
     const { connection, lastDisconnect } = update;
+
+    // Запрашиваем код только когда соединение начало инициироваться и готово
+    if (phoneNumber && !pairingRequested && !waSock.authState.creds.registered) {
+      pairingRequested = true;
+      setTimeout(async () => {
+        try {
+          const cleanPhone = phoneNumber.replace(/\D/g, '');
+          const code = await waSock.requestPairingCode(cleanPhone);
+          const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+          if (chatId) {
+            bot.sendMessage(
+              chatId,
+              `🔑 Ваш код для входа в WhatsApp:\n\n*${formattedCode}*\n\nОткройте WhatsApp -> Связанные устройства -> Привязка устройства -> Вход по номеру телефона.`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+        } catch (err) {
+          if (chatId) {
+            bot.sendMessage(chatId, `❌ Ошибка получения кода: ${err.message}. Подождите пару минут и попробуйте снова.`);
+          }
+        }
+      }, 6000); // 6 секунд на установку защищенного канала
+    }
 
     if (connection === 'open') {
       isConnected = true;
@@ -170,6 +184,7 @@ async function connectToWhatsApp(chatId = null, phoneNumber = null) {
     }
   });
 }
+
 
 // Если сессия уже сохранена, пробуем подключиться при старте
 if (fs.existsSync(AUTH_DIR)) {
