@@ -1,0 +1,19 @@
+{
+  "name": "wa-tg-broadcast-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for WhatsApp group broadcasts via Baileys on Render",
+  "main": "index.js",
+  " engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.8",
+    "express": "^4.19.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "pino": "^9.4.0",
+    "qrcode": "^1.5.4"
+  }
+}
