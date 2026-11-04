@@ -17,14 +17,18 @@ const {
 
 // ==================== КОНФИГУРАЦИЯ ====================
 const PORT = process.env.PORT || 3000;
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-
-if (!TELEGRAM_TOKEN) {
-  console.error('КРИТИЧЕСКАЯ ОШИБКА: Не задана переменная окружения TELEGRAM_TOKEN');
-  process.exit(1);
-}
-
+const TELEGRAM_TOKEN = '9069645701:AAFl6LJQxT4bA1hRLDowJLigUbeIhJR1YcA';
+const MAX_USERS = 5;
 const PAGE_SIZE = 8;
+
+// ==================== ЗАЩИТА ПРОЦЕССА ОТ КРАШЕЙ ====================
+process.on('unhandledRejection', (reason) => {
+  console.error('Перехвачена ошибка (unhandledRejection):', reason?.message || reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Критическая ошибка (uncaughtException):', err?.message || err);
+});
 
 // ==================== HTTP-СЕРВЕР ДЛЯ RENDER ====================
 const app = express();
@@ -33,16 +37,16 @@ app.get('/', (req, res) => {
   res.status(200).json({
     status: 'ok',
     activeSessions: sessions.size,
+    maxUsers: MAX_USERS,
     uptime: process.uptime()
   });
 });
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`HTTP-сервер запущен на порту ${PORT}`);
+  console.log(`HTTP-сервер слушает порт ${PORT}`);
 });
 
-// ==================== УПРАВЛЕНИЕ СЕССИЯМИ ПОЛЬЗОВАТЕЛЕЙ ====================
-// Ключ карты — Telegram chatId каждого нового пользователя
+// ==================== УПРАВЛЕНИЕ СЕССИЯМИ ====================
 const sessions = new Map();
 
 function getUserSession(chatId) {
@@ -60,32 +64,44 @@ function getUserSession(chatId) {
   return sessions.get(chatId);
 }
 
+function countConnectedUsers() {
+  let count = 0;
+  for (const session of sessions.values()) {
+    if (session.isConnected) count++;
+  }
+  return count;
+}
+
 // ==================== РАБОТА С ИСКЛЮЧЕНИЯМИ (JSON) ====================
+function getUserExclPath(chatId) {
+  return path.join(__dirname, `excluded_${chatId}.json`);
+}
+
 function loadExcludedForUser(chatId, session) {
   try {
-    const userExclFile = path.join(__dirname, `excluded_${chatId}.json`);
-    if (fs.existsSync(userExclFile)) {
-      const raw = fs.readFileSync(userExclFile, 'utf-8');
+    const file = getUserExclPath(chatId);
+    if (fs.existsSync(file)) {
+      const raw = fs.readFileSync(file, 'utf-8');
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         session.excludedGroups = new Set(parsed);
       }
     }
   } catch (err) {
-    console.error(`Ошибка чтения исключений для ${chatId}:`, err.message);
+    console.error(`Ошибка чтения исключений (${chatId}):`, err.message);
   }
 }
 
 function saveExcludedForUser(chatId, session) {
   try {
-    const userExclFile = path.join(__dirname, `excluded_${chatId}.json`);
-    fs.writeFileSync(userExclFile, JSON.stringify([...session.excludedGroups], null, 2), 'utf-8');
+    const file = getUserExclPath(chatId);
+    fs.writeFileSync(file, JSON.stringify([...session.excludedGroups], null, 2), 'utf-8');
   } catch (err) {
-    console.error(`Ошибка записи исключений для ${chatId}:`, err.message);
+    console.error(`Ошибка записи исключений (${chatId}):`, err.message);
   }
 }
 
-// ==================== ИНИЦИАЛИЗАЦИЯ TELEGRAM-БОТА ====================
+// ==================== ТЕЛЕГРАМ БОТ ====================
 const bot = new TelegramBot(TELEGRAM_TOKEN, {
   polling: {
     autoStart: false,
@@ -97,18 +113,17 @@ let pollingRestartTimer = null;
 
 async function startTelegramPolling() {
   try {
-    await bot.deleteWebHook();
+    await bot.deleteWebHook({ drop_pending_updates: true });
     await bot.startPolling();
-    console.log('Telegram-бот успешно запущен в режиме Long Polling.');
+    console.log('Telegram-бот запущен в режиме Long Polling.');
   } catch (err) {
-    console.error('Ошибка старта polling:', err.message);
+    console.error('Ошибка старта Telegram Polling:', err.message);
   }
 }
 
 bot.on('polling_error', async (err) => {
   const msg = err?.message || '';
-  if (msg.includes('409 Conflict')) {
-    console.warn('Обнаружен конфликт 409. Ожидание 5 сек...');
+  if (msg.includes('409 Conflict') || msg.includes('EFATAL')) {
     if (pollingRestartTimer) return;
     try {
       await bot.stopPolling();
@@ -116,26 +131,21 @@ bot.on('polling_error', async (err) => {
     pollingRestartTimer = setTimeout(async () => {
       pollingRestartTimer = null;
       await startTelegramPolling();
-    }, 5000);
-  } else {
-    console.error('Ошибка polling:', msg);
+    }, 4000);
   }
 });
 
-async function gracefulShutdown(signal) {
-  console.log(`Получен сигнал ${signal}. Завершение работы...`);
+async function gracefulShutdown() {
   try {
     await bot.stopPolling();
   } catch (_) {}
-  server.close(() => {
-    process.exit(0);
-  });
+  server.close(() => process.exit(0));
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
-// ==================== КЛАВИАТУРЫ TELEGRAM ====================
+// ==================== КЛАВИАТУРЫ ====================
 const MAIN_MENU_KEYBOARD = {
   reply_markup: {
     keyboard: [
@@ -231,7 +241,22 @@ function buildExcludedListKeyboard(session, page = 0) {
   return { inline_keyboard: rows };
 }
 
-// ==================== ЛОГИКА WHATSAPP ДЛЯ ПОЛЬЗОВАТЕЛЯ ====================
+// ==================== СЕРВИС WHATSAPP ====================
+function getUserAuthDir(chatId) {
+  return path.join(__dirname, `auth_info_${chatId}`);
+}
+
+function clearUserAuthFolder(chatId) {
+  try {
+    const dir = getUserAuthDir(chatId);
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  } catch (err) {
+    console.error(`Ошибка очистки auth_info (${chatId}):`, err.message);
+  }
+}
+
 async function refreshGroupsCache(session) {
   if (!session.sock || !session.isConnected) {
     throw new Error('WhatsApp не подключен.');
@@ -241,17 +266,6 @@ async function refreshGroupsCache(session) {
     .map((g) => ({ id: g.id, subject: g.subject || 'Без названия' }))
     .sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
   return session.groupsCache;
-}
-
-function clearUserAuthFolder(chatId) {
-  try {
-    const userAuthDir = path.join(__dirname, `auth_info_${chatId}`);
-    if (fs.existsSync(userAuthDir)) {
-      fs.rmSync(userAuthDir, { recursive: true, force: true });
-    }
-  } catch (err) {
-    console.error(`Ошибка удаления папки сессии для ${chatId}:`, err.message);
-  }
 }
 
 async function connectToWhatsApp(chatId, phoneNumber = null, forceQr = false) {
@@ -268,8 +282,8 @@ async function connectToWhatsApp(chatId, phoneNumber = null, forceQr = false) {
       session.sock = null;
     }
 
-    const userAuthDir = path.join(__dirname, `auth_info_${chatId}`);
-    const { state, saveCreds } = await useMultiFileAuthState(userAuthDir);
+    const authDir = getUserAuthDir(chatId);
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const { version } = await fetchLatestBaileysVersion();
 
     session.sock = makeWASocket({
@@ -277,66 +291,64 @@ async function connectToWhatsApp(chatId, phoneNumber = null, forceQr = false) {
       auth: state,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
-      browser: Browsers.ubuntu('Chrome'),
+      browser: Browsers.macOS('Desktop'),
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
-      keepAliveIntervalMs: 30000,
+      keepAliveIntervalMs: 25000,
       markOnlineOnConnect: false,
       syncFullHistory: false
     });
 
     session.sock.ev.on('creds.update', saveCreds);
 
-    let pairingCodeSent = false;
+    let pairingRequested = false;
 
     session.sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr && !state.creds.registered) {
-        if (phoneNumber && !forceQr && !pairingCodeSent) {
-          pairingCodeSent = true;
+        if (phoneNumber && !forceQr && !pairingRequested) {
+          pairingRequested = true;
           try {
-            await delay(2000);
+            await delay(2500);
             const code = await session.sock.requestPairingCode(phoneNumber);
-            const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+            const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
 
             await bot.sendMessage(
               chatId,
-              `🔐 *Код сопряжения WhatsApp:*\n\n\`${formattedCode}\`\n\n` +
+              `🔐 *Код привязки WhatsApp:*\n\n\`${formatted}\`\n\n` +
                 `1. Откройте WhatsApp на телефоне.\n` +
-                `2. Связанные устройства -> Привязка устройства -> Связать по номеру.`,
+                `2. Нажмите: *Связанные устройства* ➔ *Привязка устройства* ➔ *Связать по номеру телефона*.\n\n` +
+                `_Если код не принимается, нажмите кнопку ниже для входа по QR-коду._`,
               {
                 parse_mode: 'Markdown',
                 reply_markup: {
-                  inline_keyboard: [[{ text: '📷 Получить QR-код (резерв)', callback_data: 'force_qr' }]]
+                  inline_keyboard: [[{ text: '📷 Вход по QR-коду (резерв)', callback_data: 'force_qr' }]]
                 }
               }
             );
           } catch (err) {
-            console.error('Ошибка запроса Pairing Code:', err.message);
-            await sendQrToTelegram(chatId, qr, '⚠️ Не удалось запросить код по номеру. Отсканируйте QR-код:');
+            console.error(`Ошибка сопряжения (${chatId}):`, err.message);
+            await sendQrCode(chatId, qr, '⚠️ Ошибка запроса кода. Отсканируйте резервный QR-код:');
           }
         } else if (!phoneNumber || forceQr) {
-          await sendQrToTelegram(chatId, qr, '📷 Отсканируйте этот QR-код в WhatsApp:');
+          await sendQrCode(chatId, qr, '📷 Отсканируйте этот QR-код в WhatsApp (Связанные устройства):');
         }
       }
 
       if (connection === 'open') {
         session.isConnected = true;
         session.isConnecting = false;
-        console.log(`WhatsApp успешно подключен для пользователя ${chatId}!`);
+        console.log(`WhatsApp подключен для пользователя ${chatId}`);
 
         loadExcludedForUser(chatId, session);
-
         try {
           await refreshGroupsCache(session);
-        } catch (err) {
-          console.error('Не удалось загрузить группы:', err.message);
-        }
+        } catch (_) {}
 
         await bot.sendMessage(
           chatId,
-          `✅ *WhatsApp успешно подключен!*\nЗагружено групп: *${session.groupsCache.length}*\n\nОтправьте текст для рассылки.`,
+          `✅ *WhatsApp успешно подключен!*\nЗагружено групп: *${session.groupsCache.length}*\n\nОтправьте текст сообщения для рассылки.`,
           { parse_mode: 'Markdown', ...MAIN_MENU_KEYBOARD }
         );
       }
@@ -346,13 +358,23 @@ async function connectToWhatsApp(chatId, phoneNumber = null, forceQr = false) {
         session.isConnecting = false;
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const errString = String(lastDisconnect?.error || '');
+        const isBadMac = errString.includes('Bad MAC');
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut && !isBadMac;
 
-        if (statusCode === DisconnectReason.loggedOut) {
+        console.log(`WhatsApp закрыт (${chatId}). Код: ${statusCode}, BadMAC: ${isBadMac}`);
+
+        if (statusCode === DisconnectReason.loggedOut || isBadMac) {
           clearUserAuthFolder(chatId);
           session.groupsCache = [];
-          await bot.sendMessage(chatId, '⚠️ Сессия завершена (разлогин).', MAIN_MENU_KEYBOARD);
-        } else if (shouldReconnect && fs.existsSync(path.join(userAuthDir, 'creds.json'))) {
+          await bot.sendMessage(
+            chatId,
+            isBadMac
+              ? '⚠️ Сессия повреждена (Bad MAC). Авторизация сброшена. Нажмите «Войти в аккаунт» заново.'
+              : '⚠️ Сессия завершена. Нажмите «Войти в аккаунт».',
+            MAIN_MENU_KEYBOARD
+          );
+        } else if (shouldReconnect && fs.existsSync(path.join(authDir, 'creds.json'))) {
           if (state.creds.registered) {
             setTimeout(() => connectToWhatsApp(chatId, null, false), 5000);
           }
@@ -361,59 +383,62 @@ async function connectToWhatsApp(chatId, phoneNumber = null, forceQr = false) {
     });
   } catch (err) {
     session.isConnecting = false;
-    console.error(`Ошибка инициализации WhatsApp для ${chatId}:`, err.message);
-    await bot.sendMessage(chatId, `❌ Ошибка инициализации: ${err.message}`);
+    console.error(`Ошибка запуска WhatsApp (${chatId}):`, err.message);
+    await bot.sendMessage(chatId, `❌ Ошибка подключения: ${err.message}`);
   }
 }
 
-async function sendQrToTelegram(chatId, qrData, captionText) {
+async function sendQrCode(chatId, qrData, caption) {
   try {
-    const qrBuffer = await QRCode.toBuffer(qrData, { scale: 8, margin: 2 });
-    await bot.sendPhoto(chatId, qrBuffer, { caption: captionText });
+    const buffer = await QRCode.toBuffer(qrData, { scale: 8, margin: 2 });
+    await bot.sendPhoto(chatId, buffer, { caption });
   } catch (err) {
-    console.error('Ошибка генерации QR:', err.message);
+    console.error('Ошибка создания QR:', err.message);
   }
 }
 
 async function broadcastMessage(chatId, session, targetGroups, text) {
   if (!session.sock || !session.isConnected) {
-    return bot.sendMessage(chatId, '❌ WhatsApp не подключен. Сначала войдите.');
+    return bot.sendMessage(chatId, '❌ WhatsApp не подключен. Сначала выполните вход.');
   }
   if (targetGroups.length === 0) {
     return bot.sendMessage(chatId, '⚠️ Нет доступных групп для рассылки.');
   }
 
-  let sentCount = 0;
-  let errorCount = 0;
+  let success = 0;
+  let fails = 0;
 
-  const statusMsg = await bot.sendMessage(chatId, `⏳ Рассылка по *${targetGroups.length}* группам...`, { parse_mode: 'Markdown' });
+  const status = await bot.sendMessage(
+    chatId,
+    `⏳ Рассылка по *${targetGroups.length}* группам началась...`,
+    { parse_mode: 'Markdown' }
+  );
 
   for (let i = 0; i < targetGroups.length; i++) {
     const group = targetGroups[i];
     try {
       await session.sock.sendMessage(group.id, { text });
-      sentCount++;
-    } catch (err) {
-      errorCount++;
+      success++;
+    } catch (_) {
+      fails++;
     }
 
     if (i < targetGroups.length - 1) {
-      await delay(Math.floor(1500 + Math.random() * 500));
+      await delay(1500 + Math.floor(Math.random() * 500));
     }
   }
 
   try {
-    await bot.editMessageText(`✅ *Рассылка завершена!*\n\nУспешно: *${sentCount}*\nОшибок: *${errorCount}*`, {
-      chat_id: chatId,
-      message_id: statusMsg.message_id,
-      parse_mode: 'Markdown'
-    });
+    await bot.editMessageText(
+      `✅ *Рассылка завершена!*\n\nУспешно отправлено: *${success}*\nОшибок: *${fails}*`,
+      { chat_id: chatId, message_id: status.message_id, parse_mode: 'Markdown' }
+    );
   } catch (_) {
-    await bot.sendMessage(chatId, `✅ Рассылка завершена! Успешно: ${sentCount}, Ошибок: ${errorCount}`);
+    await bot.sendMessage(chatId, `✅ Рассылка завершена! Успешно: ${success}, Ошибок: ${fails}`);
   }
 }
 
-// ==================== ОБРАБОТЧИКИ TELEGRAM ====================
+// ==================== ОБРАБОТКА КОМАНД TELEGRAM ====================
 bot.onText(/^\/start/, async (msg) => {
   const chatId = msg.chat.id;
   const session = getUserSession(chatId);
@@ -422,10 +447,11 @@ bot.onText(/^\/start/, async (msg) => {
 
   await bot.sendMessage(
     chatId,
-    `👋 *Панель рассылок WhatsApp*\n\n` +
-      `Статус вашего WhatsApp: ${session.isConnected ? '🟢 Подключен' : '🔴 Не подключен'}\n` +
-      `Ваших групп в кэше: *${session.groupsCache.length}*\n\n` +
-      `Выберите действие:`,
+    `👋 *Панель управления рассылками WhatsApp*\n\n` +
+      `Статус вашего аккаунта: ${session.isConnected ? '🟢 Подключен' : '🔴 Не подключен'}\n` +
+      `Групп в вашем кэше: *${session.groupsCache.length}*\n` +
+      `Активных пользователей в системе: *${countConnectedUsers()}/${MAX_USERS}*\n\n` +
+      `Выберите пункт меню:`,
     { parse_mode: 'Markdown', ...MAIN_MENU_KEYBOARD }
   );
 });
@@ -440,13 +466,27 @@ bot.on('message', async (msg) => {
 
   if (text === 'Войти в аккаунт') {
     if (session.isConnected) {
-      return bot.sendMessage(chatId, '🟢 Вы уже авторизованы в своем WhatsApp!', MAIN_MENU_KEYBOARD);
+      return bot.sendMessage(chatId, '🟢 Вы уже вошли в свой WhatsApp!', MAIN_MENU_KEYBOARD);
     }
+
+    if (countConnectedUsers() >= MAX_USERS && !fs.existsSync(getUserAuthDir(chatId))) {
+      return bot.sendMessage(
+        chatId,
+        `⚠️ Достигнут лимит системы (максимум ${MAX_USERS} активных пользователей). Попробуйте позже.`
+      );
+    }
+
     session.step = 'AWAITING_PHONE';
     return bot.sendMessage(
       chatId,
-      '📱 Введите ваш номер телефона WhatsApp в международном формате (например, `79991234567`):',
-      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '📷 Войти по QR-коду', callback_data: 'force_qr' }]] } }
+      '📱 Отправьте ваш номер WhatsApp (международный формат без пробелов, например `79991234567`):\n\n' +
+        '_Или нажмите кнопку ниже для моментального входа по QR:_',
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[{ text: '📷 Войти по QR-коду', callback_data: 'force_qr' }]]
+        }
+      }
     );
   }
 
@@ -476,14 +516,14 @@ bot.on('message', async (msg) => {
 
   if (text === 'Обновить список групп') {
     if (!session.isConnected) return bot.sendMessage(chatId, '🔴 WhatsApp не подключен.');
-    const waitMsg = await bot.sendMessage(chatId, '🔄 Обновляю список...');
+    const waitMsg = await bot.sendMessage(chatId, '🔄 Обновляю список групп...');
     try {
       await refreshGroupsCache(session);
       await bot.editMessageText(`✅ Список обновлен! Групп: *${session.groupsCache.length}*`, {
         chat_id: chatId, message_id: waitMsg.message_id, parse_mode: 'Markdown'
       });
     } catch (err) {
-      await bot.editMessageText(`❌ Ошибка: ${err.message}`, { chat_id: chatId, message_id: waitMsg.message_id });
+      await bot.editMessageText(`❌ Ошибка обновления: ${err.message}`, { chat_id: chatId, message_id: waitMsg.message_id });
     }
     return;
   }
@@ -491,7 +531,7 @@ bot.on('message', async (msg) => {
   if (text === 'Список исключение') {
     const excludedList = session.groupsCache.filter((g) => session.excludedGroups.has(g.id));
     if (excludedList.length === 0) return bot.sendMessage(chatId, '✅ Список исключений пуст.');
-    return bot.sendMessage(chatId, `🚫 *Исключения (${excludedList.length}):* Нажмите, чтобы убрать:`, {
+    return bot.sendMessage(chatId, `🚫 *Исключения (${excludedList.length}):* Нажмите, чтобы удалить:`, {
       parse_mode: 'Markdown',
       reply_markup: buildExcludedListKeyboard(session, 0)
     });
@@ -512,18 +552,18 @@ bot.on('message', async (msg) => {
     session.groupsCache = [];
     clearUserAuthFolder(chatId);
 
-    return bot.sendMessage(chatId, '👋 Вы вышли из своего аккаунта WhatsApp.', MAIN_MENU_KEYBOARD);
+    return bot.sendMessage(chatId, '👋 Вы вышли из своего аккаунта WhatsApp. Данные очищены.', MAIN_MENU_KEYBOARD);
   }
 
   if (session.step === 'AWAITING_PHONE') {
     const cleanPhone = text.replace(/\D/g, '');
     if (cleanPhone.length < 10 || cleanPhone.length > 15) {
-      return bot.sendMessage(chatId, '⚠️ Некорректный формат номера. Введите от 10 до 15 цифр:');
+      return bot.sendMessage(chatId, '⚠️ Введите корректный номер (от 10 до 15 цифр):');
     }
 
     session.step = 'IDLE';
     clearUserAuthFolder(chatId);
-    await bot.sendMessage(chatId, `⏳ Запрашиваю код для \`+${cleanPhone}\`...`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `⏳ Запрашиваю код привязки для \`+${cleanPhone}\`...`, { parse_mode: 'Markdown' });
     await connectToWhatsApp(chatId, cleanPhone, false);
     return;
   }
@@ -537,7 +577,7 @@ bot.on('message', async (msg) => {
   }
 
   session.draftText = text;
-  await bot.sendMessage(chatId, `📝 *Текст сохранен:*\n\n${text}\n\n👇 Выберите действие:`, {
+  await bot.sendMessage(chatId, `📝 *Текст для рассылки:*\n\n${text}\n\n👇 Выберите вариант отправки:`, {
     parse_mode: 'Markdown',
     reply_markup: getBroadcastMenuKeyboard()
   });
@@ -562,7 +602,7 @@ bot.on('callback_query', async (query) => {
 
   if (data === 'b_back') {
     await bot.answerCallbackQuery(query.id);
-    return bot.editMessageText(`📝 *Текст сохранен:*\n\n${session.draftText || '(пусто)'}\n\n👇 Выберите действие:`, {
+    return bot.editMessageText(`📝 *Текст для рассылки:*\n\n${session.draftText || '(пусто)'}\n\n👇 Выберите вариант:`, {
       chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getBroadcastMenuKeyboard()
     });
   }
@@ -570,15 +610,15 @@ bot.on('callback_query', async (query) => {
   if (data.startsWith('b_one_page:')) {
     const page = parseInt(data.split(':')[1], 10) || 0;
     await bot.answerCallbackQuery(query.id);
-    return bot.editMessageText('🎯 *Выберите группу:*', {
+    return bot.editMessageText('🎯 *Выберите целевую группу:*', {
       chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: buildSingleGroupKeyboard(session, page)
     });
   }
 
   if (data.startsWith('send_one:')) {
     const group = session.groupsCache[parseInt(data.split(':')[1], 10)];
-    if (!group) return bot.answerCallbackQuery(query.id, { text: 'Не найдено', show_alert: true });
-    await bot.answerCallbackQuery(query.id, { text: `Отправка в ${group.subject}...` });
+    if (!group) return bot.answerCallbackQuery(query.id, { text: 'Группа не найдена', show_alert: true });
+    await bot.answerCallbackQuery(query.id, { text: `Отправляю в ${group.subject}...` });
     await broadcastMessage(chatId, session, [group], session.draftText);
     return;
   }
@@ -586,14 +626,14 @@ bot.on('callback_query', async (query) => {
   if (data === 'b_rand10') {
     const available = session.groupsCache.filter((g) => !session.excludedGroups.has(g.id));
     const shuffled = [...available].sort(() => 0.5 - Math.random());
-    await bot.answerCallbackQuery(query.id, { text: 'Запуск рассылки...' });
+    await bot.answerCallbackQuery(query.id, { text: 'Рассылка в 10 случайных...' });
     await broadcastMessage(chatId, session, shuffled.slice(0, 10), session.draftText);
     return;
   }
 
   if (data === 'b_all') {
     const available = session.groupsCache.filter((g) => !session.excludedGroups.has(g.id));
-    await bot.answerCallbackQuery(query.id, { text: 'Запуск рассылки...' });
+    await bot.answerCallbackQuery(query.id, { text: 'Рассылка во все группы...' });
     await broadcastMessage(chatId, session, available, session.draftText);
     return;
   }
@@ -601,7 +641,7 @@ bot.on('callback_query', async (query) => {
   if (data.startsWith('b_excl_page:')) {
     const page = parseInt(data.split(':')[1], 10) || 0;
     await bot.answerCallbackQuery(query.id);
-    return bot.editMessageText('🚫 *Управление исключениями:*', {
+    return bot.editMessageText('🚫 *Управление исключениями (нажмите для переключения):*', {
       chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: buildManageExclusionsKeyboard(session, page)
     });
   }
@@ -620,7 +660,7 @@ bot.on('callback_query', async (query) => {
     }
     saveExcludedForUser(chatId, session);
 
-    await bot.answerCallbackQuery(query.id, { text: 'Обновлено' });
+    await bot.answerCallbackQuery(query.id, { text: 'Статус изменен' });
     return bot.editMessageReplyMarkup(buildManageExclusionsKeyboard(session, page), { chat_id: chatId, message_id: messageId });
   }
 
@@ -638,7 +678,7 @@ bot.on('callback_query', async (query) => {
     if (group && session.excludedGroups.has(group.id)) {
       session.excludedGroups.delete(group.id);
       saveExcludedForUser(chatId, session);
-      await bot.answerCallbackQuery(query.id, { text: 'Удалено из исключений' });
+      await bot.answerCallbackQuery(query.id, { text: 'Удалено' });
     }
 
     const remaining = session.groupsCache.filter((g) => session.excludedGroups.has(g.id));
@@ -652,18 +692,23 @@ bot.on('callback_query', async (query) => {
   }
 });
 
-// ==================== ЗАПУСК ====================
+// ==================== СТАРТ ПРИЛОЖЕНИЯ ====================
 (async () => {
   await startTelegramPolling();
 
-  // Автоматически поднимаем сессии для всех, кто уже авторизовался ранее
-  fs.readdirSync(__dirname).forEach((file) => {
-    if (file.startsWith('auth_info_')) {
-      const chatId = Number(file.replace('auth_info_', ''));
-      if (chatId) {
-        console.log(`Обнаружена сохраненная сессия WhatsApp для пользователя ${chatId}. Подключение...`);
-        connectToWhatsApp(chatId, null, false);
+  try {
+    const files = fs.readdirSync(__dirname);
+    for (const file of files) {
+      if (file.startsWith('auth_info_')) {
+        const chatId = Number(file.replace('auth_info_', ''));
+        const credsPath = path.join(__dirname, file, 'creds.json');
+        if (chatId && fs.existsSync(credsPath)) {
+          console.log(`Восстановление сессии для ${chatId}...`);
+          connectToWhatsApp(chatId, null, false);
+        }
       }
     }
-  });
+  } catch (err) {
+    console.error('Ошибка восстановления сессий:', err.message);
+  }
 })();
