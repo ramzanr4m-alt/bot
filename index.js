@@ -5,6 +5,8 @@ const pino = require('pino');
 const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 
 const makeWASocket = baileys.default?.default || baileys.default || baileys;
 const {
@@ -19,7 +21,7 @@ const {
 // ==================== КОНФИГУРАЦИЯ ====================
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_TOKEN = '9069645701:AAFl6LJQxT4bA1hRLDowJLigUbeIhJR1YcA';
-const OWNER_ID = 5846687574; // Главный администратор (не входит в лимит MAX_USERS)
+const OWNER_ID = 5846687574; // Главный администратор (вне лимита)
 const MAX_USERS = 7;         // Максимум подключенных клиентов (не считая админа)
 const PAGE_SIZE = 8;
 
@@ -34,9 +36,22 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err?.message || err);
 });
 
-// Экранирование спецсимволов для безопасного Markdown в Telegram
 function escapeMd(text = '') {
   return String(text).replace(/([_*`\[])/g, '\\$1');
+}
+
+function downloadBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https') ? https : http;
+    client.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const data = [];
+      res.on('data', (chunk) => data.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(data)));
+    }).on('error', reject);
+  });
 }
 
 // ==================== HTTP-СЕРВЕР ДЛЯ RENDER ====================
@@ -116,64 +131,6 @@ function saveUsersMeta() {
 loadBanned();
 loadUsersMeta();
 
-function getUserSession(chatId) {
-  const numId = Number(chatId);
-  if (!sessions.has(numId)) {
-    const savedMeta = usersMeta.get(numId) || {};
-    sessions.set(numId, {
-      sock: null,
-      isConnected: false,
-      isConnecting: false,
-      isBroadcasting: false,
-      pairingSent: false,
-      phoneNumber: null,
-      forceQr: false,
-      qrCount: 0,
-      groupsCache: [],
-      excludedGroups: new Set(),
-      step: 'IDLE',
-      draftText: '',
-      reconnectTimer: null,
-      name: savedMeta.name || '',
-      username: savedMeta.username || '',
-      notifiedOwner: Boolean(savedMeta.notifiedOwner)
-    });
-  }
-  return sessions.get(numId);
-}
-
-function updateUserInfo(msg) {
-  if (!msg || !msg.from) return;
-  const chatId = Number(msg.chat.id);
-  const session = getUserSession(chatId);
-  const first = msg.from.first_name || '';
-  const last = msg.from.last_name ? ` ${msg.from.last_name}` : '';
-  const newName = `${first}${last}`.trim() || 'Без имени';
-  const newUsername = msg.from.username ? `@${msg.from.username}` : '';
-
-  if (session.name !== newName || session.username !== newUsername) {
-    session.name = newName;
-    session.username = newUsername;
-    usersMeta.set(chatId, {
-      name: session.name,
-      username: session.username,
-      notifiedOwner: session.notifiedOwner
-    });
-    saveUsersMeta();
-  }
-}
-
-// Считает подключенных пользователей БЕЗ учёта администратора
-function countConnectedClients() {
-  let count = 0;
-  for (const [id, s] of sessions.entries()) {
-    if (id !== OWNER_ID && s.isConnected) {
-      count++;
-    }
-  }
-  return count;
-}
-
 // ==================== РАБОТА С ИСКЛЮЧЕНИЯМИ (JSON) ====================
 function getUserExclPath(chatId) {
   return path.join(__dirname, `excluded_${chatId}.json`);
@@ -200,6 +157,69 @@ function saveExcludedForUser(chatId, session) {
   } catch (err) {
     console.error(`Ошибка сохранения исключений (${chatId}):`, err.message);
   }
+}
+
+function getUserSession(chatId) {
+  const numId = Number(chatId);
+  if (!sessions.has(numId)) {
+    const savedMeta = usersMeta.get(numId) || {};
+    const newSession = {
+      sock: null,
+      isConnected: false,
+      isConnecting: false,
+      isBroadcasting: false,
+      pairingSent: false,
+      phoneNumber: null,
+      forceQr: false,
+      qrCount: 0,
+      groupsCache: [],
+      excludedGroups: new Set(),
+      step: 'IDLE',
+      draft: {
+        type: 'text', // 'text' | 'photo' | 'video'
+        text: '',
+        fileId: null
+      },
+      reconnectTimer: null,
+      name: savedMeta.name || '',
+      username: savedMeta.username || '',
+      notifiedOwner: Boolean(savedMeta.notifiedOwner)
+    };
+    loadExcludedForUser(numId, newSession);
+    sessions.set(numId, newSession);
+  }
+  return sessions.get(numId);
+}
+
+function updateUserInfo(msg) {
+  if (!msg || !msg.from) return;
+  const chatId = Number(msg.chat.id);
+  const session = getUserSession(chatId);
+  const first = msg.from.first_name || '';
+  const last = msg.from.last_name ? ` ${msg.from.last_name}` : '';
+  const newName = `${first}${last}`.trim() || 'Без имени';
+  const newUsername = msg.from.username ? `@${msg.from.username}` : '';
+
+  if (session.name !== newName || session.username !== newUsername) {
+    session.name = newName;
+    session.username = newUsername;
+    usersMeta.set(chatId, {
+      name: session.name,
+      username: session.username,
+      notifiedOwner: session.notifiedOwner
+    });
+    saveUsersMeta();
+  }
+}
+
+function countConnectedClients() {
+  let count = 0;
+  for (const [id, s] of sessions.entries()) {
+    if (id !== OWNER_ID && s.isConnected) {
+      count++;
+    }
+  }
+  return count;
 }
 
 // ==================== ИНИЦИАЛИЗАЦИЯ TELEGRAM ====================
@@ -295,10 +315,8 @@ function buildAdminKeyboard() {
     const shortName = rawName.length > 14 ? rawName.slice(0, 14) + '…' : rawName;
     const statusDot = isBanned ? '🚫' : isConn ? '🟢' : '🔴';
 
-    // Заголовок-разделитель с именем клиента
     rows.push([{ text: `${statusDot} ${shortName} (${id})`, callback_data: 'noop' }]);
 
-    // Кнопки управления конкретным клиентом
     const actionRow = [];
     if (isBanned) {
       actionRow.push({ text: '✅ Разбан', callback_data: `adm_unban:${id}` });
@@ -359,6 +377,7 @@ function buildAdminText() {
   return text;
 }
 
+// ==================== КЛАВИАТУРЫ ПАГИНАЦИИ И ИСКЛЮЧЕНИЙ ====================
 function buildSingleGroupKeyboard(session, page = 0) {
   const available = session.groupsCache
     .map((g, idx) => ({ ...g, idx }))
@@ -374,34 +393,48 @@ function buildSingleGroupKeyboard(session, page = 0) {
 
   const navRow = [];
   if (currentPage > 0) navRow.push({ text: '⬅️ Назад', callback_data: `b_one_page:${currentPage - 1}` });
-  navRow.push({ text: `${currentPage + 1}/${totalPages}`, callback_data: 'noop' });
+  navRow.push({ text: `Стр. ${currentPage + 1}/${totalPages}`, callback_data: 'noop' });
   if (currentPage < totalPages - 1) navRow.push({ text: 'Вперёд ➡️', callback_data: `b_one_page:${currentPage + 1}` });
   rows.push(navRow);
-  rows.push([{ text: '🔙 Назад к действиям', callback_data: 'b_back' }]);
+  rows.push([{ text: '🔙 Назад к выбору рассылки', callback_data: 'b_back' }]);
 
   return { inline_keyboard: rows };
 }
 
-function buildManageExclusionsKeyboard(session, page = 0) {
+function buildManageExclusionsKeyboard(session, page = 0, fromMainMenu = false) {
   const totalPages = Math.max(1, Math.ceil(session.groupsCache.length / PAGE_SIZE));
   const currentPage = Math.min(Math.max(0, page), totalPages - 1);
   const start = currentPage * PAGE_SIZE;
   const slice = session.groupsCache.slice(start, start + PAGE_SIZE);
 
+  const prefix = fromMainMenu ? 'm' : 'b';
+
   const rows = slice.map((g, i) => {
     const globalIdx = start + i;
     const isExcl = session.excludedGroups.has(g.id);
     return [
-      { text: `${isExcl ? '🚫 [ИСКЛ]' : '✅'} ${g.subject.slice(0, 40)}`, callback_data: `tog_excl:${globalIdx}:${currentPage}` }
+      {
+        text: `${isExcl ? '🚫 [ИСКЛ]' : '✅ [АКТИВ]'} ${g.subject.slice(0, 38)}`,
+        callback_data: `tog_excl:${globalIdx}:${currentPage}:${prefix}`
+      }
     ];
   });
 
   const navRow = [];
-  if (currentPage > 0) navRow.push({ text: '⬅️ Назад', callback_data: `b_excl_page:${currentPage - 1}` });
-  navRow.push({ text: `${currentPage + 1}/${totalPages}`, callback_data: 'noop' });
-  if (currentPage < totalPages - 1) navRow.push({ text: 'Вперёд ➡️', callback_data: `b_excl_page:${currentPage + 1}` });
+  if (currentPage > 0) {
+    navRow.push({ text: '⬅️ Назад', callback_data: `${prefix}_excl_page:${currentPage - 1}` });
+  }
+  navRow.push({ text: `Стр. ${currentPage + 1}/${totalPages}`, callback_data: 'noop' });
+  if (currentPage < totalPages - 1) {
+    navRow.push({ text: 'Вперёд ➡️', callback_data: `${prefix}_excl_page:${currentPage + 1}` });
+  }
   rows.push(navRow);
-  rows.push([{ text: '🔙 Назад к действиям', callback_data: 'b_back' }]);
+
+  if (fromMainMenu) {
+    rows.push([{ text: '📋 Показать только исключенные', callback_data: 'excl_only_page:0' }]);
+  } else {
+    rows.push([{ text: '🔙 Назад к выбору рассылки', callback_data: 'b_back' }]);
+  }
 
   return { inline_keyboard: rows };
 }
@@ -411,24 +444,26 @@ function buildExcludedListKeyboard(session, page = 0) {
     .map((g, idx) => ({ ...g, idx }))
     .filter((g) => session.excludedGroups.has(g.id));
 
-  if (excludedArray.length === 0) return { inline_keyboard: [] };
+  const rows = [];
+  if (excludedArray.length > 0) {
+    const totalPages = Math.max(1, Math.ceil(excludedArray.length / PAGE_SIZE));
+    const currentPage = Math.min(Math.max(0, page), totalPages - 1);
+    const slice = excludedArray.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
 
-  const totalPages = Math.max(1, Math.ceil(excludedArray.length / PAGE_SIZE));
-  const currentPage = Math.min(Math.max(0, page), totalPages - 1);
-  const slice = excludedArray.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
+    for (const g of slice) {
+      rows.push([{ text: `❌ Вернуть: ${g.subject.slice(0, 40)}`, callback_data: `rm_excl:${g.idx}:${currentPage}` }]);
+    }
 
-  const rows = slice.map((g) => [
-    { text: `❌ Убрать: ${g.subject.slice(0, 40)}`, callback_data: `rm_excl:${g.idx}:${currentPage}` }
-  ]);
-
-  if (totalPages > 1) {
-    const navRow = [];
-    if (currentPage > 0) navRow.push({ text: '⬅️ Назад', callback_data: `excl_list_page:${currentPage - 1}` });
-    navRow.push({ text: `${currentPage + 1}/${totalPages}`, callback_data: 'noop' });
-    if (currentPage < totalPages - 1) navRow.push({ text: 'Вперёд ➡️', callback_data: `excl_list_page:${currentPage + 1}` });
-    rows.push(navRow);
+    if (totalPages > 1) {
+      const navRow = [];
+      if (currentPage > 0) navRow.push({ text: '⬅️ Назад', callback_data: `excl_only_page:${currentPage - 1}` });
+      navRow.push({ text: `Стр. ${currentPage + 1}/${totalPages}`, callback_data: 'noop' });
+      if (currentPage < totalPages - 1) navRow.push({ text: 'Вперёд ➡️', callback_data: `excl_only_page:${currentPage + 1}` });
+      rows.push(navRow);
+    }
   }
 
+  rows.push([{ text: '➕ Добавить / убрать группы из всех', callback_data: 'm_excl_page:0' }]);
   return { inline_keyboard: rows };
 }
 
@@ -474,6 +509,15 @@ async function refreshGroupsCache(session) {
     .map((g) => ({ id: g.id, subject: g.subject || 'Без названия' }))
     .sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
   return session.groupsCache;
+}
+
+async function ensureGroupsLoaded(chatId, session) {
+  loadExcludedForUser(chatId, session);
+  if (session.groupsCache.length === 0 && session.isConnected) {
+    try {
+      await refreshGroupsCache(session);
+    } catch (_) {}
+  }
 }
 
 async function startWhatsAppSession(chatId, options = {}) {
@@ -602,7 +646,7 @@ async function startWhatsAppSession(chatId, options = {}) {
           numId,
           `✅ *WhatsApp успешно подключен!*\n` +
             `Групп загружено: *${session.groupsCache.length}*\n\n` +
-            `Теперь просто отправьте любой текст в чат, чтобы сделать рассылку.`,
+            `Отправьте мне *текст*, *фото* или *видео* с подписью, чтобы сделать рассылку.`,
           { parse_mode: 'Markdown', ...getMainMenuKeyboard(numId) }
         );
       }
@@ -657,32 +701,40 @@ async function sendQrCode(chatId, qrData, caption) {
   }
 }
 
-// ==================== ФУНКЦИЯ РАССЫЛКИ ====================
-async function broadcastMessage(chatId, session, targetGroups, text) {
+// ==================== ФУНКЦИЯ РАССЫЛКИ (ТЕКСТ + ФОТО + ВИДЕО) ====================
+async function broadcastMessage(chatId, session, targetGroups) {
   if (!session.sock || !session.isConnected) {
     return bot.sendMessage(chatId, '❌ WhatsApp не подключен. Сначала нажмите «Войти в аккаунт».');
-  }
-  if (!text || !text.trim()) {
-    return bot.sendMessage(chatId, '⚠️ Текст рассылки пуст. Отправьте новый текст в чат.');
   }
   if (session.isBroadcasting) {
     return bot.sendMessage(chatId, '⏳ Дождитесь завершения текущей рассылки!');
   }
   if (targetGroups.length === 0) {
-    return bot.sendMessage(chatId, '⚠️ Нет доступных групп для рассылки.');
+    return bot.sendMessage(chatId, '⚠️ Нет доступных групп для рассылки (возможно, все группы в исключениях).');
+  }
+
+  const { type, text, fileId } = session.draft;
+  if (type === 'text' && (!text || !text.trim())) {
+    return bot.sendMessage(chatId, '⚠️ Текст рассылки пуст. Отправьте новый текст, фото или видео.');
   }
 
   session.isBroadcasting = true;
   let success = 0;
   let fails = 0;
-
   let statusMsg = null;
+
   try {
     statusMsg = await bot.sendMessage(
       chatId,
       `⏳ Начинаю рассылку по *${targetGroups.length}* группам...`,
       { parse_mode: 'Markdown' }
     );
+
+    let mediaBuffer = null;
+    if ((type === 'photo' || type === 'video') && fileId) {
+      const fileLink = await bot.getFileLink(fileId);
+      mediaBuffer = await downloadBuffer(fileLink);
+    }
 
     for (let i = 0; i < targetGroups.length; i++) {
       if (!session.isConnected || !session.sock) {
@@ -691,7 +743,13 @@ async function broadcastMessage(chatId, session, targetGroups, text) {
       }
       const group = targetGroups[i];
       try {
-        await session.sock.sendMessage(group.id, { text });
+        if (type === 'photo' && mediaBuffer) {
+          await session.sock.sendMessage(group.id, { image: mediaBuffer, caption: text || '' });
+        } else if (type === 'video' && mediaBuffer) {
+          await session.sock.sendMessage(group.id, { video: mediaBuffer, caption: text || '' });
+        } else {
+          await session.sock.sendMessage(group.id, { text: text || '' });
+        }
         success++;
       } catch (err) {
         console.error(`Ошибка отправки в ${group.id}:`, err.message);
@@ -713,14 +771,23 @@ async function broadcastMessage(chatId, session, targetGroups, text) {
         bot.sendMessage(chatId, resultText, { parse_mode: 'Markdown' }).catch(() => {});
       });
     }
+  } catch (err) {
+    await bot.sendMessage(chatId, `❌ Ошибка подготовки рассылки: ${err.message}`).catch(() => {});
   } finally {
     session.isBroadcasting = false;
   }
 }
 
-// Безопасная отправка предпросмотра текста рассылки (не ломается от спецсимволов)
-async function sendDraftPreview(chatId, draftText, messageId = null) {
-  const safePreview = `📝 Текст для рассылки сохранён:\n\n${draftText || '(пусто)'}\n\n👇 Выберите режим отправки:`;
+async function sendDraftPreview(chatId, session, messageId = null) {
+  const { type, text } = session.draft;
+  const header =
+    type === 'photo'
+      ? '🖼 Фото для рассылки сохранено!'
+      : type === 'video'
+      ? '🎬 Видео для рассылки сохранено!'
+      : '📝 Текст для рассылки сохранён!';
+
+  const safePreview = `${header}\n\n${text || '(без подписи)'}\n\n👇 Выберите режим отправки:`;
   if (messageId) {
     return bot.editMessageText(safePreview, {
       chat_id: chatId,
@@ -744,7 +811,7 @@ bot.onText(/^\/start/, async (msg) => {
 
   const session = getUserSession(chatId);
   session.step = 'IDLE';
-  loadExcludedForUser(chatId, session);
+  await ensureGroupsLoaded(chatId, session);
 
   if (chatId !== OWNER_ID && !session.notifiedOwner) {
     session.notifiedOwner = true;
@@ -770,8 +837,9 @@ bot.onText(/^\/start/, async (msg) => {
     `👋 *Панель управления рассылками WhatsApp*\n\n` +
       `Статус вашего аккаунта: ${session.isConnected ? '🟢 Подключен' : '🔴 Не подключен'}\n` +
       `Групп в кэше: *${session.groupsCache.length}*\n` +
+      `В исключениях: *${session.excludedGroups.size}*\n` +
       `Свободных слотов: *${Math.max(0, MAX_USERS - countConnectedClients())}/${MAX_USERS}*\n\n` +
-      `Выберите действие в меню ниже:`,
+      `Отправьте текст, фото или видео для рассылки, либо выберите действие в меню:`,
     { parse_mode: 'Markdown', ...getMainMenuKeyboard(chatId) }
   );
 });
@@ -780,7 +848,7 @@ bot.on('message', async (msg) => {
   const chatId = Number(msg.chat.id);
   const text = msg.text;
 
-  if (!text || text.startsWith('/start')) return;
+  if (text && text.startsWith('/start')) return;
   updateUserInfo(msg);
 
   if (bannedUsers.has(chatId) && chatId !== OWNER_ID) {
@@ -789,8 +857,7 @@ bot.on('message', async (msg) => {
 
   const session = getUserSession(chatId);
 
-  // Обработка рассылки объявления от админа всем пользователям бота
-  if (chatId === OWNER_ID && session.step === 'AWAITING_ADMIN_BROADCAST') {
+  if (chatId === OWNER_ID && session.step === 'AWAITING_ADMIN_BROADCAST' && text) {
     session.step = 'IDLE';
     if (text === 'Отмена' || text === '👑 Админ-панель') {
       return bot.sendMessage(OWNER_ID, '❌ Рассылка клиентам отменена.', getMainMenuKeyboard(OWNER_ID));
@@ -824,7 +891,6 @@ bot.on('message', async (msg) => {
       return bot.sendMessage(chatId, '🟢 Ваш WhatsApp уже подключен и готов к работе!', getMainMenuKeyboard(chatId));
     }
 
-    // Лимит проверяется только для обычных пользователей (админ входит всегда)
     if (chatId !== OWNER_ID && countConnectedClients() >= MAX_USERS && !fs.existsSync(getUserAuthDir(chatId))) {
       return bot.sendMessage(
         chatId,
@@ -837,7 +903,7 @@ bot.on('message', async (msg) => {
       chatId,
       '📱 *Введите ваш номер телефона WhatsApp в международном формате*\n' +
         '(например: `79281234567` или `+79281234567`):\n\n' +
-        '_Либо нажмите кнопку ниже, чтобы войти по QR-коду (если есть второй телефон под рукой):_',
+        '_Либо нажмите кнопку ниже, чтобы войти по QR-коду:_',
       {
         parse_mode: 'Markdown',
         reply_markup: {
@@ -850,13 +916,7 @@ bot.on('message', async (msg) => {
   if (text === 'Список групп') {
     session.step = 'IDLE';
     if (!session.isConnected) return bot.sendMessage(chatId, '🔴 WhatsApp не подключен. Нажмите «Войти в аккаунт».');
-    if (session.groupsCache.length === 0) {
-      try {
-        await refreshGroupsCache(session);
-      } catch (e) {
-        return bot.sendMessage(chatId, `❌ Ошибка получения групп: ${e.message}`);
-      }
-    }
+    await ensureGroupsLoaded(chatId, session);
     if (session.groupsCache.length === 0) return bot.sendMessage(chatId, '📭 В вашем аккаунте нет доступных групп.');
 
     const lines = session.groupsCache.map((g, idx) => {
@@ -898,12 +958,25 @@ bot.on('message', async (msg) => {
 
   if (text === 'Список исключение') {
     session.step = 'IDLE';
-    const excludedList = session.groupsCache.filter((g) => session.excludedGroups.has(g.id));
-    if (excludedList.length === 0) return bot.sendMessage(chatId, '✅ Список исключений пуст.');
-    return bot.sendMessage(chatId, `🚫 *Группы в исключениях (${excludedList.length}):*\nНажмите на группу, чтобы вернуть её в рассылку:`, {
-      parse_mode: 'Markdown',
-      reply_markup: buildExcludedListKeyboard(session, 0)
-    });
+    if (!session.isConnected) {
+      return bot.sendMessage(chatId, '🔴 Сначала подключите WhatsApp через «Войти в аккаунт», чтобы управлять группами.');
+    }
+    await ensureGroupsLoaded(chatId, session);
+    if (session.groupsCache.length === 0) {
+      return bot.sendMessage(chatId, '📭 Группы не найдены.');
+    }
+
+    const excludedCount = session.groupsCache.filter((g) => session.excludedGroups.has(g.id)).length;
+    return bot.sendMessage(
+      chatId,
+      `🚫 *Управление исключениями*\n` +
+        `Сейчас исключено групп: *${excludedCount}* из *${session.groupsCache.length}*\n\n` +
+        `Нажимайте на группы ниже, чтобы исключить их из рассылки (🚫) или вернуть обратно (✅):`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: buildManageExclusionsKeyboard(session, 0, true)
+      }
+    );
   }
 
   if (text === 'Выйти из ватсап') {
@@ -924,7 +997,7 @@ bot.on('message', async (msg) => {
     );
   }
 
-  if (session.step === 'AWAITING_PHONE') {
+  if (session.step === 'AWAITING_PHONE' && text) {
     let cleanPhone = text.replace(/\D/g, '');
     if (cleanPhone.length === 11 && cleanPhone.startsWith('8')) {
       cleanPhone = '7' + cleanPhone.slice(1);
@@ -957,14 +1030,36 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(chatId, '⚠️ Сначала войдите в WhatsApp! Нажмите кнопку «Войти в аккаунт».', getMainMenuKeyboard(chatId));
   }
 
-  if (session.groupsCache.length === 0) {
-    try {
-      await refreshGroupsCache(session);
-    } catch (_) {}
+  await ensureGroupsLoaded(chatId, session);
+
+  // Приём ФОТО, ВИДЕО или ТЕКСТА
+  if (msg.photo && msg.photo.length > 0) {
+    const bestPhoto = msg.photo[msg.photo.length - 1];
+    session.draft = {
+      type: 'photo',
+      fileId: bestPhoto.file_id,
+      text: msg.caption || ''
+    };
+    return sendDraftPreview(chatId, session);
   }
 
-  session.draftText = text;
-  await sendDraftPreview(chatId, text);
+  if (msg.video) {
+    session.draft = {
+      type: 'video',
+      fileId: msg.video.file_id,
+      text: msg.caption || ''
+    };
+    return sendDraftPreview(chatId, session);
+  }
+
+  if (text) {
+    session.draft = {
+      type: 'text',
+      fileId: null,
+      text
+    };
+    return sendDraftPreview(chatId, session);
+  }
 });
 
 // ==================== ОБРАБОТКА INLINE-КНОПОК ====================
@@ -1097,15 +1192,17 @@ bot.on('callback_query', async (query) => {
     return;
   }
 
+  await ensureGroupsLoaded(chatId, session);
+
   if (data === 'b_back') {
     await bot.answerCallbackQuery(query.id);
-    return sendDraftPreview(chatId, session.draftText, messageId).catch(() => {});
+    return sendDraftPreview(chatId, session, messageId).catch(() => {});
   }
 
   if (data.startsWith('b_one_page:')) {
     const page = parseInt(data.split(':')[1], 10) || 0;
     await bot.answerCallbackQuery(query.id);
-    return bot.editMessageText('🎯 *Выберите группу для отправки:*', {
+    return bot.editMessageText(`🎯 *Выберите группу для отправки (Стр. ${page + 1}):*`, {
       chat_id: chatId,
       message_id: messageId,
       parse_mode: 'Markdown',
@@ -1117,7 +1214,7 @@ bot.on('callback_query', async (query) => {
     const group = session.groupsCache[parseInt(data.split(':')[1], 10)];
     if (!group) return bot.answerCallbackQuery(query.id, { text: 'Группа не найдена', show_alert: true });
     await bot.answerCallbackQuery(query.id, { text: `Отправляю в ${group.subject.slice(0, 20)}...` });
-    await broadcastMessage(chatId, session, [group], session.draftText);
+    await broadcastMessage(chatId, session, [group]);
     return;
   }
 
@@ -1129,58 +1226,88 @@ bot.on('callback_query', async (query) => {
       [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
     await bot.answerCallbackQuery(query.id, { text: 'Запуск рассылки в 10 групп...' });
-    await broadcastMessage(chatId, session, shuffled.slice(0, 10), session.draftText);
+    await broadcastMessage(chatId, session, shuffled.slice(0, 10));
     return;
   }
 
   if (data === 'b_all') {
     const available = session.groupsCache.filter((g) => !session.excludedGroups.has(g.id));
     await bot.answerCallbackQuery(query.id, { text: 'Запуск общей рассылки...' });
-    await broadcastMessage(chatId, session, available, session.draftText);
+    await broadcastMessage(chatId, session, available);
     return;
   }
 
-  if (data.startsWith('b_excl_page:')) {
+  // Перелистывание страниц исключений (из меню рассылки или из главного меню)
+  if (data.startsWith('b_excl_page:') || data.startsWith('m_excl_page:')) {
+    const isMain = data.startsWith('m_');
     const page = parseInt(data.split(':')[1], 10) || 0;
+    const excludedCount = session.groupsCache.filter((g) => session.excludedGroups.has(g.id)).length;
     await bot.answerCallbackQuery(query.id);
-    return bot.editMessageText('🚫 *Нажмите на группу, чтобы добавить/убрать из исключений:*', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: buildManageExclusionsKeyboard(session, page)
-    }).catch(() => {});
+    return bot.editMessageText(
+      `🚫 *Управление исключениями (Стр. ${page + 1})*\n` +
+        `Исключено групп: *${excludedCount}* из *${session.groupsCache.length}*\n\n` +
+        `Нажмите на группу, чтобы добавить или убрать из исключений:`,
+      {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        reply_markup: buildManageExclusionsKeyboard(session, page, isMain)
+      }
+    ).catch(() => {});
   }
 
+  // Включение / выключение группы в исключениях
   if (data.startsWith('tog_excl:')) {
-    const [, idxStr, pageStr] = data.split(':');
+    const [, idxStr, pageStr, prefix] = data.split(':');
+    const isMain = prefix === 'm';
     const group = session.groupsCache[parseInt(idxStr, 10)];
     const page = parseInt(pageStr, 10) || 0;
 
-    if (!group) return bot.answerCallbackQuery(query.id);
+    if (!group) return bot.answerCallbackQuery(query.id, { text: 'Группа не найдена' });
 
     if (session.excludedGroups.has(group.id)) {
       session.excludedGroups.delete(group.id);
+      await bot.answerCallbackQuery(query.id, { text: '✅ Возвращена в рассылку' });
     } else {
       session.excludedGroups.add(group.id);
+      await bot.answerCallbackQuery(query.id, { text: '🚫 Добавлена в исключения' });
     }
     saveExcludedForUser(chatId, session);
 
-    await bot.answerCallbackQuery(query.id, { text: 'Статус обновлён' });
-    return bot.editMessageReplyMarkup(buildManageExclusionsKeyboard(session, page), {
-      chat_id: chatId,
-      message_id: messageId
-    }).catch(() => {});
+    const excludedCount = session.groupsCache.filter((g) => session.excludedGroups.has(g.id)).length;
+    return bot.editMessageText(
+      `🚫 *Управление исключениями (Стр. ${page + 1})*\n` +
+        `Исключено групп: *${excludedCount}* из *${session.groupsCache.length}*\n\n` +
+        `Нажмите на группу, чтобы добавить или убрать из исключений:`,
+      {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        reply_markup: buildManageExclusionsKeyboard(session, page, isMain)
+      }
+    ).catch(() => {});
   }
 
-  if (data.startsWith('excl_list_page:')) {
+  // Просмотр только исключенных групп
+  if (data.startsWith('excl_only_page:')) {
     const page = parseInt(data.split(':')[1], 10) || 0;
+    const excludedList = session.groupsCache.filter((g) => session.excludedGroups.has(g.id));
     await bot.answerCallbackQuery(query.id);
-    return bot.editMessageReplyMarkup(buildExcludedListKeyboard(session, page), {
+
+    const title =
+      excludedList.length === 0
+        ? `✅ *Список исключений пуст.*`
+        : `🚫 *Группы в исключениях (${excludedList.length}) — Стр. ${page + 1}:*\nНажмите на группу, чтобы вернуть её в рассылку:`;
+
+    return bot.editMessageText(title, {
       chat_id: chatId,
-      message_id: messageId
+      message_id: messageId,
+      parse_mode: 'Markdown',
+      reply_markup: buildExcludedListKeyboard(session, page)
     }).catch(() => {});
   }
 
+  // Удаление из исключений
   if (data.startsWith('rm_excl:')) {
     const [, idxStr, pageStr] = data.split(':');
     const group = session.groupsCache[parseInt(idxStr, 10)];
@@ -1189,18 +1316,18 @@ bot.on('callback_query', async (query) => {
     if (group && session.excludedGroups.has(group.id)) {
       session.excludedGroups.delete(group.id);
       saveExcludedForUser(chatId, session);
-      await bot.answerCallbackQuery(query.id, { text: 'Удалено из исключений' });
+      await bot.answerCallbackQuery(query.id, { text: '✅ Группа возвращена в рассылку' });
+    } else {
+      await bot.answerCallbackQuery(query.id);
     }
 
     const remaining = session.groupsCache.filter((g) => session.excludedGroups.has(g.id));
-    if (remaining.length === 0) {
-      return bot.editMessageText('✅ Список исключений пуст.', {
-        chat_id: chatId,
-        message_id: messageId
-      }).catch(() => {});
-    }
+    const title =
+      remaining.length === 0
+        ? `✅ *Список исключений пуст.*`
+        : `🚫 *Группы в исключениях (${remaining.length}):*\nНажмите на группу, чтобы вернуть её в рассылку:`;
 
-    return bot.editMessageText(`🚫 *Группы в исключениях (${remaining.length}):*`, {
+    return bot.editMessageText(title, {
       chat_id: chatId,
       message_id: messageId,
       parse_mode: 'Markdown',
