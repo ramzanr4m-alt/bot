@@ -19,6 +19,7 @@ const {
 // ==================== КОНФИГУРАЦИЯ ====================
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_TOKEN = '9069645701:AAFl6LJQxT4bA1hRLDowJLigUbeIhJR1YcA';
+const OWNER_ID = 5846687574; // Твой админский ID
 const MAX_USERS = 5;
 const PAGE_SIZE = 8;
 
@@ -51,6 +52,31 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 
 // ==================== УПРАВЛЕНИЕ СЕССИЯМИ ПОЛЬЗОВАТЕЛЕЙ ====================
 const sessions = new Map();
+const bannedUsers = new Set();
+const BANNED_FILE = path.join(__dirname, 'banned.json');
+
+function loadBanned() {
+  try {
+    if (fs.existsSync(BANNED_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(BANNED_FILE, 'utf-8'));
+      if (Array.isArray(parsed)) {
+        parsed.forEach((id) => bannedUsers.add(Number(id)));
+      }
+    }
+  } catch (err) {
+    console.error('Ошибка чтения banned.json:', err.message);
+  }
+}
+
+function saveBanned() {
+  try {
+    fs.writeFileSync(BANNED_FILE, JSON.stringify([...bannedUsers], null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Ошибка сохранения banned.json:', err.message);
+  }
+}
+
+loadBanned();
 
 function getUserSession(chatId) {
   if (!sessions.has(chatId)) {
@@ -66,10 +92,21 @@ function getUserSession(chatId) {
       excludedGroups: new Set(),
       step: 'IDLE',
       draftText: '',
-      reconnectTimer: null
+      reconnectTimer: null,
+      name: '',
+      username: ''
     });
   }
   return sessions.get(chatId);
+}
+
+function updateUserInfo(msg) {
+  if (!msg || !msg.from) return;
+  const session = getUserSession(msg.chat.id);
+  const first = msg.from.first_name || '';
+  const last = msg.from.last_name ? ` ${msg.from.last_name}` : '';
+  session.name = `${first}${last}`.trim() || 'Без имени';
+  session.username = msg.from.username ? `@${msg.from.username}` : '';
 }
 
 function countConnectedUsers() {
@@ -153,16 +190,22 @@ process.on('SIGTERM', gracefulShutdown);
 process.on('SIGINT', gracefulShutdown);
 
 // ==================== КЛАВИАТУРЫ TELEGRAM ====================
-const MAIN_MENU_KEYBOARD = {
-  reply_markup: {
-    keyboard: [
-      [{ text: 'Войти в аккаунт' }, { text: 'Список групп' }],
-      [{ text: 'Обновить список групп' }, { text: 'Список исключение' }],
-      [{ text: 'Выйти из ватсап' }]
-    ],
-    resize_keyboard: true
+function getMainMenuKeyboard(chatId) {
+  const keyboard = [
+    [{ text: 'Войти в аккаунт' }, { text: 'Список групп' }],
+    [{ text: 'Обновить список групп' }, { text: 'Список исключение' }],
+    [{ text: 'Выйти из ватсап' }]
+  ];
+  if (chatId === OWNER_ID) {
+    keyboard.push([{ text: '👑 Админ-панель' }]);
   }
-};
+  return {
+    reply_markup: {
+      keyboard,
+      resize_keyboard: true
+    }
+  };
+}
 
 function getBroadcastMenuKeyboard() {
   return {
@@ -173,6 +216,63 @@ function getBroadcastMenuKeyboard() {
       [{ text: '🚫 Добавить в исключения', callback_data: 'b_excl_page:0' }]
     ]
   };
+}
+
+function buildAdminKeyboard() {
+  const rows = [];
+  const allIds = new Set([...sessions.keys(), ...bannedUsers]);
+  allIds.delete(OWNER_ID); // Себя в списке кика/бана не выводим
+
+  for (const id of allIds) {
+    const s = sessions.get(id);
+    const isBanned = bannedUsers.has(id);
+    const isConn = s?.isConnected;
+    const labelName = s?.name ? `${s.name} (${id})` : `ID: ${id}`;
+    const statusIcon = isBanned ? '🚫' : isConn ? '🟢' : '🔴';
+
+    const actionRow = [];
+    if (isConn) {
+      actionRow.push({ text: `🔌 Кик WA (${labelName})`, callback_data: `adm_kick:${id}` });
+    }
+    if (isBanned) {
+      actionRow.push({ text: `✅ Разбан ${statusIcon} ${labelName}`, callback_data: `adm_unban:${id}` });
+    } else {
+      actionRow.push({ text: `🔨 Бан ${statusIcon} ${labelName}`, callback_data: `adm_ban:${id}` });
+    }
+    rows.push(actionRow);
+  }
+
+  rows.push([{ text: '🔄 Обновить панель', callback_data: 'adm_refresh' }]);
+  return { inline_keyboard: rows };
+}
+
+function buildAdminText() {
+  const allIds = new Set([...sessions.keys(), ...bannedUsers]);
+  allIds.delete(OWNER_ID);
+
+  let text = `👑 *Админ-панель управления доступом*\n`;
+  text += `Всего подключено к WhatsApp: *${countConnectedUsers()}/${MAX_USERS}*\n\n`;
+
+  if (allIds.size === 0) {
+    text += `_Пока никто, кроме тебя, не запускал бота._`;
+    return text;
+  }
+
+  text += `*Список пользователей:*\n`;
+  for (const id of allIds) {
+    const s = sessions.get(id);
+    const isBanned = bannedUsers.has(id);
+    const status = isBanned
+      ? '🚫 ЗАБЛОКИРОВАН'
+      : s?.isConnected
+      ? `🟢 Подключен (Групп: ${s.groupsCache.length})`
+      : '🔴 Не подключен';
+    const userTitle = s?.name ? `${s.name} ${s.username || ''}`.trim() : 'Неизвестный';
+    text += `• *${userTitle}* — \`${id}\`\n  Статус: ${status}\n\n`;
+  }
+
+  text += `👇 _Используй кнопки ниже, чтобы выкинуть человека из WhatsApp или заблокировать ему доступ:_`;
+  return text;
 }
 
 function buildSingleGroupKeyboard(session, page = 0) {
@@ -294,7 +394,6 @@ async function refreshGroupsCache(session) {
 async function startWhatsAppSession(chatId, options = {}) {
   const session = getUserSession(chatId);
 
-  // Если передан новый вход (по номеру или QR), сбрасываем старый сокет
   if (options.reset) {
     destroySocket(session);
     clearUserAuthFolder(chatId);
@@ -325,7 +424,6 @@ async function startWhatsAppSession(chatId, options = {}) {
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
       printQRInTerminal: false,
-      // КРИТИЧНО: для работы requestPairingCode нужен именно браузер Chrome (Ubuntu/Linux)
       browser: Browsers.ubuntu('Chrome'),
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
@@ -343,9 +441,7 @@ async function startWhatsAppSession(chatId, options = {}) {
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      // Обработка авторизации (Pairing Code или QR)
       if (qr && !state.creds.registered) {
-        // 1. Вход по номеру телефона (Pairing Code)
         if (session.phoneNumber && !session.forceQr) {
           if (!session.pairingSent) {
             session.pairingSent = true;
@@ -381,7 +477,6 @@ async function startWhatsAppSession(chatId, options = {}) {
             }
           }
         } else {
-          // 2. Вход по QR-коду
           session.qrCount++;
           if (session.qrCount <= 3) {
             await sendQrCode(
@@ -395,13 +490,12 @@ async function startWhatsAppSession(chatId, options = {}) {
             await bot.sendMessage(
               chatId,
               '⌛ Время ожидания сканирования QR-кода истекло. Нажмите «Войти в аккаунт», чтобы попробовать снова.',
-              MAIN_MENU_KEYBOARD
+              getMainMenuKeyboard(chatId)
             );
           }
         }
       }
 
-      // Соединение успешно открыто
       if (connection === 'open') {
         session.isConnected = true;
         session.isConnecting = false;
@@ -423,11 +517,10 @@ async function startWhatsAppSession(chatId, options = {}) {
           `✅ *WhatsApp успешно подключен!*\n` +
             `Групп загружено: *${session.groupsCache.length}*\n\n` +
             `Теперь просто отправьте любой текст в чат, чтобы сделать рассылку.`,
-          { parse_mode: 'Markdown', ...MAIN_MENU_KEYBOARD }
+          { parse_mode: 'Markdown', ...getMainMenuKeyboard(chatId) }
         );
       }
 
-      // Обработка закрытия соединения и перезапусков
       if (connection === 'close') {
         session.isConnected = false;
         session.isConnecting = false;
@@ -448,13 +541,11 @@ async function startWhatsAppSession(chatId, options = {}) {
             isBadMac
               ? '⚠️ Сбой ключей шифрования (Bad MAC). Сессия автоматически очищена. Нажмите «Войти в аккаунт» для чистого входа.'
               : '🔴 Вы вышли из WhatsApp на телефоне. Сессия удалена. Нажмите «Войти в аккаунт» для повторного входа.',
-            MAIN_MENU_KEYBOARD
+            getMainMenuKeyboard(chatId)
           );
           return;
         }
 
-        // ВАЖНО: При коде 515 (restartRequired после ввода кода сопряжения) или разрыве сети
-        // переподключаем сокет даже если привязка еще в процессе завершения!
         const hasCredsFile = fs.existsSync(path.join(authDir, 'creds.json'));
         if (hasCredsFile || session.pairingSent || statusCode === DisconnectReason.restartRequired || statusCode === 515) {
           const delayMs = statusCode === DisconnectReason.restartRequired || statusCode === 515 ? 1000 : 3500;
@@ -526,9 +617,25 @@ async function broadcastMessage(chatId, session, targetGroups, text) {
 // ==================== ОБРАБОТЧИКИ КОМАНД TELEGRAM ====================
 bot.onText(/^\/start/, async (msg) => {
   const chatId = msg.chat.id;
+  updateUserInfo(msg);
+
+  if (bannedUsers.has(chatId) && chatId !== OWNER_ID) {
+    return bot.sendMessage(chatId, '⛔ Доступ к боту закрыт администратором.');
+  }
+
   const session = getUserSession(chatId);
   session.step = 'IDLE';
   loadExcludedForUser(chatId, session);
+
+  // Оповещаем тебя, если в бота зашел новый человек
+  if (chatId !== OWNER_ID && !session.notifiedOwner) {
+    session.notifiedOwner = true;
+    bot.sendMessage(
+      OWNER_ID,
+      `🔔 *Новый вход в бота:*\nИмя: ${session.name} ${session.username}\nID: \`${chatId}\`\n\nУправлять доступом можно через кнопку «👑 Админ-панель».`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+  }
 
   await bot.sendMessage(
     chatId,
@@ -537,7 +644,7 @@ bot.onText(/^\/start/, async (msg) => {
       `Групп в кэше: *${session.groupsCache.length}*\n` +
       `Активных пользователей: *${countConnectedUsers()}/${MAX_USERS}*\n\n` +
       `Выберите действие в меню ниже:`,
-    { parse_mode: 'Markdown', ...MAIN_MENU_KEYBOARD }
+    { parse_mode: 'Markdown', ...getMainMenuKeyboard(chatId) }
   );
 });
 
@@ -546,12 +653,25 @@ bot.on('message', async (msg) => {
   const text = msg.text;
 
   if (!text || text.startsWith('/start')) return;
+  updateUserInfo(msg);
+
+  if (bannedUsers.has(chatId) && chatId !== OWNER_ID) {
+    return bot.sendMessage(chatId, '⛔ Доступ к боту закрыт администратором.');
+  }
 
   const session = getUserSession(chatId);
 
+  // Кнопка Админ-панели (доступна только тебе)
+  if (text === '👑 Админ-панель' && chatId === OWNER_ID) {
+    return bot.sendMessage(OWNER_ID, buildAdminText(), {
+      parse_mode: 'Markdown',
+      reply_markup: buildAdminKeyboard()
+    });
+  }
+
   if (text === 'Войти в аккаунт') {
     if (session.isConnected) {
-      return bot.sendMessage(chatId, '🟢 Ваш WhatsApp уже подключен и готов к работе!', MAIN_MENU_KEYBOARD);
+      return bot.sendMessage(chatId, '🟢 Ваш WhatsApp уже подключен и готов к работе!', getMainMenuKeyboard(chatId));
     }
 
     if (countConnectedUsers() >= MAX_USERS && !fs.existsSync(getUserAuthDir(chatId))) {
@@ -646,14 +766,12 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(
       chatId,
       '👋 Сессия WhatsApp полностью сброшена и удалена. Вы можете привязать аккаунт заново через «Войти в аккаунт».',
-      MAIN_MENU_KEYBOARD
+      getMainMenuKeyboard(chatId)
     );
   }
 
-  // Ввод номера телефона для получения 8-значного кода
   if (session.step === 'AWAITING_PHONE') {
     let cleanPhone = text.replace(/\D/g, '');
-    // Если ввели российский номер через 8 (например 8928...), автоматически меняем 8 на 7
     if (cleanPhone.length === 11 && cleanPhone.startsWith('8')) {
       cleanPhone = '7' + cleanPhone.slice(1);
     }
@@ -681,9 +799,8 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // Сохранение текста рассылки
   if (!session.isConnected) {
-    return bot.sendMessage(chatId, '⚠️ Сначала войдите в WhatsApp! Нажмите кнопку «Войти в аккаунт».', MAIN_MENU_KEYBOARD);
+    return bot.sendMessage(chatId, '⚠️ Сначала войдите в WhatsApp! Нажмите кнопку «Войти в аккаунт».', getMainMenuKeyboard(chatId));
   }
 
   if (session.groupsCache.length === 0) {
@@ -709,10 +826,75 @@ bot.on('callback_query', async (query) => {
   const messageId = query.message.message_id;
   const data = query.data;
 
+  if (bannedUsers.has(chatId) && chatId !== OWNER_ID) {
+    return bot.answerCallbackQuery(query.id, { text: 'Доступ закрыт администратором.', show_alert: true });
+  }
+
   const session = getUserSession(chatId);
 
   if (data === 'noop') return bot.answerCallbackQuery(query.id);
 
+  // ==================== ОБРАБОТКА АДМИН-КНОПОК ====================
+  if (data.startsWith('adm_') && chatId === OWNER_ID) {
+    if (data === 'adm_refresh') {
+      await bot.answerCallbackQuery(query.id, { text: 'Обновлено' });
+      return bot.editMessageText(buildAdminText(), {
+        chat_id: OWNER_ID,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        reply_markup: buildAdminKeyboard()
+      }).catch(() => {});
+    }
+
+    const [action, targetIdStr] = data.split(':');
+    const targetId = Number(targetIdStr);
+
+    if (action === 'adm_kick') {
+      const targetSession = sessions.get(targetId);
+      if (targetSession) {
+        if (targetSession.sock) {
+          try { await targetSession.sock.logout().catch(() => {}); } catch (_) {}
+        }
+        destroySocket(targetSession);
+        targetSession.groupsCache = [];
+      }
+      clearUserAuthFolder(targetId);
+      bot.sendMessage(targetId, '⚠️ Ваша сессия WhatsApp была отключена администратором.').catch(() => {});
+      await bot.answerCallbackQuery(query.id, { text: `Пользователь ${targetId} отключен от WA` });
+    }
+
+    if (action === 'adm_ban') {
+      bannedUsers.add(targetId);
+      saveBanned();
+      const targetSession = sessions.get(targetId);
+      if (targetSession) {
+        if (targetSession.sock) {
+          try { await targetSession.sock.logout().catch(() => {}); } catch (_) {}
+        }
+        destroySocket(targetSession);
+        targetSession.groupsCache = [];
+      }
+      clearUserAuthFolder(targetId);
+      bot.sendMessage(targetId, '⛔ Администратор закрыл вам доступ к боту.').catch(() => {});
+      await bot.answerCallbackQuery(query.id, { text: `Пользователь ${targetId} забанен!` });
+    }
+
+    if (action === 'adm_unban') {
+      bannedUsers.delete(targetId);
+      saveBanned();
+      bot.sendMessage(targetId, '✅ Администратор открыл вам доступ к боту! Нажмите /start').catch(() => {});
+      await bot.answerCallbackQuery(query.id, { text: `Пользователь ${targetId} разбанен!` });
+    }
+
+    return bot.editMessageText(buildAdminText(), {
+      chat_id: OWNER_ID,
+      message_id: messageId,
+      parse_mode: 'Markdown',
+      reply_markup: buildAdminKeyboard()
+    }).catch(() => {});
+  }
+
+  // ==================== ОБЫЧНЫЕ КНОПКИ ====================
   if (data === 'force_qr') {
     session.step = 'IDLE';
     await bot.answerCallbackQuery(query.id, { text: 'Генерирую QR-код...' });
@@ -849,21 +1031,19 @@ bot.on('callback_query', async (query) => {
 (async () => {
   await startTelegramPolling();
 
-  // Восстанавливаем только полностью зарегистрированные сессии
   try {
     const files = fs.readdirSync(__dirname);
     for (const file of files) {
       if (file.startsWith('auth_info_')) {
         const chatId = Number(file.replace('auth_info_', ''));
         const credsFile = path.join(__dirname, file, 'creds.json');
-        if (chatId && fs.existsSync(credsFile)) {
+        if (chatId && !bannedUsers.has(chatId) && fs.existsSync(credsFile)) {
           try {
             const creds = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
             if (creds && creds.registered) {
               console.log(`Восстановление активной сессии для ${chatId}...`);
               startWhatsAppSession(chatId, { reset: false });
             } else {
-              // Удаляем недопривязанную сессию, чтобы она не мешала новому входу
               clearUserAuthFolder(chatId);
             }
           } catch (_) {
