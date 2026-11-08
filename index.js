@@ -23,8 +23,8 @@ const PORT = process.env.PORT || 3000;
 const TELEGRAM_TOKEN = '9069645701:AAFl6LJQxT4bA1hRLDowJLigUbeIhJR1YcA';
 const OWNER_ID = 5846687574;            // Главный создатель (неприкасаемый)
 const SUB_ADMINS = new Set([8264531154]); // Младшие админы (ты можешь их банить, они тебя — нет)
-const MAX_USERS = 10;                   // Максимум подключенных клиентов
-const PAGE_SIZE = 11;
+const MAX_USERS = 25;                   // Максимум подключенных клиентов
+const PAGE_SIZE = 26;
 
 const logger = pino({ level: 'silent' });
 
