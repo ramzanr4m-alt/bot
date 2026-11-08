@@ -21,11 +21,28 @@ const {
 // ==================== КОНФИГУРАЦИЯ ====================
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_TOKEN = '9069645701:AAFl6LJQxT4bA1hRLDowJLigUbeIhJR1YcA';
-const OWNER_ID = 5846687574; // Главный администратор
-const MAX_USERS = 10;         // Максимум подключенных клиентов
+const OWNER_ID = 5846687574;            // Главный создатель (неприкасаемый)
+const SUB_ADMINS = new Set([8264531154]); // Младшие админы (ты можешь их банить, они тебя — нет)
+const MAX_USERS = 10;                   // Максимум подключенных клиентов
 const PAGE_SIZE = 11;
 
 const logger = pino({ level: 'silent' });
+
+// Проверка прав: главный админ всегда прав, младший админ — только если не в бане
+function isOwner(chatId) {
+  return Number(chatId) === OWNER_ID;
+}
+
+function isSubAdmin(chatId) {
+  return SUB_ADMINS.has(Number(chatId));
+}
+
+function isAdmin(chatId) {
+  const numId = Number(chatId);
+  if (numId === OWNER_ID) return true;
+  if (SUB_ADMINS.has(numId) && !bannedUsers.has(numId)) return true;
+  return false;
+}
 
 // ==================== ЗАЩИТА ОТ ПАДЕНИЙ ====================
 process.on('unhandledRejection', (reason) => {
@@ -198,10 +215,11 @@ function updateUserInfo(msg) {
   }
 }
 
+// Считаем только обычных клиентов (ты и младший админ слоты не занимаете)
 function countConnectedClients() {
   let count = 0;
   for (const [id, s] of sessions.entries()) {
-    if (id !== OWNER_ID && s.isConnected) {
+    if (!isOwner(id) && !isSubAdmin(id) && s.isConnected) {
       count++;
     }
   }
@@ -259,7 +277,7 @@ function getMainMenuKeyboard(chatId) {
     [{ text: 'Обновить список групп' }, { text: 'Список исключение' }],
     [{ text: 'Выйти из ватсап' }]
   ];
-  if (Number(chatId) === OWNER_ID) {
+  if (isAdmin(chatId)) {
     keyboard.push([{ text: '👑 Админ-панель' }]);
   }
   return {
@@ -281,27 +299,36 @@ function getBroadcastMenuKeyboard() {
   };
 }
 
-// ==================== АДМИН-ПАНЕЛЬ ====================
-function getAllClientIds() {
-  const allIds = new Set([...sessions.keys(), ...bannedUsers, ...usersMeta.keys()]);
+// ==================== АДМИН-ПАНЕЛЬ С ИЕРАРХИЕЙ ====================
+function getVisibleUserIds(viewerId) {
+  const allIds = new Set([...sessions.keys(), ...bannedUsers, ...usersMeta.keys(), ...SUB_ADMINS]);
+  // Главного создателя (OWNER_ID) никогда нет в списке на кик/бан
   allIds.delete(OWNER_ID);
+
+  // Если панель открыл младший админ — убираем из списка его самого и других младших админов
+  if (!isOwner(viewerId)) {
+    for (const subId of SUB_ADMINS) {
+      allIds.delete(subId);
+    }
+  }
   return [...allIds];
 }
 
-function buildAdminKeyboard() {
+function buildAdminKeyboard(viewerId) {
   const rows = [];
-  const clientIds = getAllClientIds();
+  const clientIds = getVisibleUserIds(viewerId);
 
   for (const id of clientIds) {
     const s = sessions.get(id);
     const meta = usersMeta.get(id) || {};
     const isBanned = bannedUsers.has(id);
     const isConn = Boolean(s?.isConnected);
+    const roleTag = isSubAdmin(id) ? '⭐️ [АДМИН] ' : '';
     const rawName = s?.name || meta.name || `ID:${id}`;
-    const shortName = rawName.length > 14 ? rawName.slice(0, 14) + '…' : rawName;
+    const shortName = rawName.length > 12 ? rawName.slice(0, 12) + '…' : rawName;
     const statusDot = isBanned ? '🚫' : isConn ? '🟢' : '🔴';
 
-    rows.push([{ text: `${statusDot} ${shortName} (${id})`, callback_data: 'noop' }]);
+    rows.push([{ text: `${statusDot} ${roleTag}${shortName} (${id})`, callback_data: 'noop' }]);
 
     const actionRow = [];
     if (isBanned) {
@@ -324,17 +351,18 @@ function buildAdminKeyboard() {
   return { inline_keyboard: rows };
 }
 
-function buildAdminText() {
-  const clientIds = getAllClientIds();
-  const ownerSession = sessions.get(OWNER_ID);
+function buildAdminText(viewerId) {
+  const clientIds = getVisibleUserIds(viewerId);
+  const viewerSession = sessions.get(Number(viewerId));
+  const roleTitle = isOwner(viewerId) ? 'Главный Создатель' : 'Администратор';
 
-  let text = `👑 Панель управления клиентами\n\n`;
-  text += `👤 Твой статус WA: ${ownerSession?.isConnected ? `🟢 Подключен (${ownerSession.groupsCache.length} гр.)` : '🔴 Не подключен'}\n`;
+  let text = `👑 Панель управления (${roleTitle})\n\n`;
+  text += `👤 Твой статус WA: ${viewerSession?.isConnected ? `🟢 Подключен (${viewerSession.groupsCache.length} гр.)` : '🔴 Не подключен'}\n`;
   text += `📊 Слоты клиентов: ${countConnectedClients()} из ${MAX_USERS}\n`;
-  text += `👥 Всего в базе: ${clientIds.length} чел.\n\n`;
+  text += `👥 Доступно в списке: ${clientIds.length} чел.\n\n`;
 
   if (clientIds.length === 0) {
-    text += `Пока ни один клиент не запускал бота.`;
+    text += `Пока ни один пользователь не запускал бота.`;
     return text;
   }
 
@@ -343,6 +371,7 @@ function buildAdminText() {
     const s = sessions.get(id);
     const meta = usersMeta.get(id) || {};
     const isBanned = bannedUsers.has(id);
+    const roleTag = isSubAdmin(id) ? '⭐️ [Мл. Админ] ' : '';
 
     const status = isBanned
       ? '🚫 ЗАБЛОКИРОВАН'
@@ -352,7 +381,7 @@ function buildAdminText() {
 
     const name = s?.name || meta.name || 'Без имени';
     const user = s?.username || meta.username || '';
-    text += `• ${name} ${user} [${id}] — ${status}\n`;
+    text += `• ${roleTag}${name} ${user} [${id}] — ${status}\n`;
   }
 
   return text;
@@ -386,7 +415,6 @@ function buildSingleGroupKeyboard(session, page = 0) {
   return { inline_keyboard: rows };
 }
 
-// Универсальная отрисовка меню исключений (работает и из главного меню, и из рассылки)
 async function renderExclusionsMenu(chatId, session, page = 0, mode = 'm', messageId = null) {
   const totalGroups = session.groupsCache.length;
   const totalPages = Math.max(1, Math.ceil(totalGroups / PAGE_SIZE));
@@ -631,7 +659,6 @@ async function startWhatsAppSession(chatId, options = {}) {
         const isBadMac = errMessage.includes('Bad MAC');
         const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403;
 
-        // Если сессия слетела или разлогинена — полностью останавливаем цикл!
         if (isLoggedOut || isBadMac) {
           destroySocket(session);
           clearUserAuthFolder(numId);
@@ -648,7 +675,6 @@ async function startWhatsAppSession(chatId, options = {}) {
           return;
         }
 
-        // Переподключаем ТОЛЬКО если это код 515 (после ввода кода) или если аккаунт реально зарегистрирован
         const isRegistered = Boolean(state?.creds?.registered);
         if (isRegistered || session.pairingSent || statusCode === DisconnectReason.restartRequired || statusCode === 515) {
           const delayMs = statusCode === DisconnectReason.restartRequired || statusCode === 515 ? 1200 : 4000;
@@ -658,7 +684,6 @@ async function startWhatsAppSession(chatId, options = {}) {
             }
           }, delayMs);
         } else {
-          // Если сессия не была зарегистрирована и закрылась — чистим мусор без спама
           destroySocket(session);
           clearUserAuthFolder(numId);
         }
@@ -778,15 +803,15 @@ bot.onText(/^\/start/, async (msg) => {
   const chatId = Number(msg.chat.id);
   updateUserInfo(msg);
 
-  if (bannedUsers.has(chatId) && chatId !== OWNER_ID) {
-    return bot.sendMessage(chatId, '⛔ Доступ к боту закрыт администратором.');
+  if (bannedUsers.has(chatId) && !isOwner(chatId)) {
+    return bot.sendMessage(chatId, '⛔ Доступ к боту закрыт главным администратором.');
   }
 
   const session = getUserSession(chatId);
   session.step = 'IDLE';
   await ensureGroupsLoaded(chatId, session);
 
-  if (chatId !== OWNER_ID && !session.notifiedOwner) {
+  if (!isOwner(chatId) && !session.notifiedOwner) {
     session.notifiedOwner = true;
     usersMeta.set(chatId, {
       name: session.name,
@@ -820,20 +845,20 @@ bot.on('message', async (msg) => {
   if (text && text.startsWith('/start')) return;
   updateUserInfo(msg);
 
-  if (bannedUsers.has(chatId) && chatId !== OWNER_ID) {
-    return bot.sendMessage(chatId, '⛔ Доступ к боту закрыт администратором.');
+  if (bannedUsers.has(chatId) && !isOwner(chatId)) {
+    return bot.sendMessage(chatId, '⛔ Доступ к боту закрыт главным администратором.');
   }
 
   const session = getUserSession(chatId);
 
-  if (chatId === OWNER_ID && session.step === 'AWAITING_ADMIN_BROADCAST' && text) {
+  if (isAdmin(chatId) && session.step === 'AWAITING_ADMIN_BROADCAST' && text) {
     session.step = 'IDLE';
     if (text === 'Отмена' || text === '👑 Админ-панель') {
-      return bot.sendMessage(OWNER_ID, '❌ Рассылка отменена.', getMainMenuKeyboard(OWNER_ID));
+      return bot.sendMessage(chatId, '❌ Рассылка отменена.', getMainMenuKeyboard(chatId));
     }
-    const clientIds = getAllClientIds();
+    const targetIds = getVisibleUserIds(chatId);
     let sent = 0;
-    for (const id of clientIds) {
+    for (const id of targetIds) {
       if (!bannedUsers.has(id)) {
         try {
           await bot.sendMessage(id, `📢 Сообщение от администратора:\n\n${text}`);
@@ -841,13 +866,13 @@ bot.on('message', async (msg) => {
         } catch (_) {}
       }
     }
-    return bot.sendMessage(OWNER_ID, `✅ Доставлено: ${sent} чел.`, getMainMenuKeyboard(OWNER_ID));
+    return bot.sendMessage(chatId, `✅ Доставлено: ${sent} чел.`, getMainMenuKeyboard(chatId));
   }
 
-  if (text === '👑 Админ-панель' && chatId === OWNER_ID) {
+  if (text === '👑 Админ-панель' && isAdmin(chatId)) {
     session.step = 'IDLE';
-    return bot.sendMessage(OWNER_ID, buildAdminText(), {
-      reply_markup: buildAdminKeyboard()
+    return bot.sendMessage(chatId, buildAdminText(chatId), {
+      reply_markup: buildAdminKeyboard(chatId)
     });
   }
 
@@ -856,7 +881,7 @@ bot.on('message', async (msg) => {
       return bot.sendMessage(chatId, '🟢 Ваш WhatsApp уже подключен!', getMainMenuKeyboard(chatId));
     }
 
-    if (chatId !== OWNER_ID && countConnectedClients() >= MAX_USERS && !fs.existsSync(getUserAuthDir(chatId))) {
+    if (!isAdmin(chatId) && countConnectedClients() >= MAX_USERS && !fs.existsSync(getUserAuthDir(chatId))) {
       return bot.sendMessage(chatId, `⚠️ Все клиентские слоты заняты (${MAX_USERS}/${MAX_USERS}).`);
     }
 
@@ -914,7 +939,6 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // Поддержка обоих вариантов написания кнопки исключений
   if (text === 'Список исключение' || text === 'Список исключений') {
     session.step = 'IDLE';
     if (!session.isConnected) {
@@ -1009,33 +1033,49 @@ bot.on('callback_query', async (query) => {
   const messageId = query.message.message_id;
   const data = query.data || '';
 
-  if (bannedUsers.has(chatId) && chatId !== OWNER_ID) {
-    return bot.answerCallbackQuery(query.id, { text: 'Доступ закрыт.', show_alert: true });
+  if (bannedUsers.has(chatId) && !isOwner(chatId)) {
+    return bot.answerCallbackQuery(query.id, { text: 'Доступ закрыт главным администратором.', show_alert: true });
   }
 
   const session = getUserSession(chatId);
 
   if (data === 'noop') return bot.answerCallbackQuery(query.id);
 
-  // Админ-кнопки
-  if (data.startsWith('adm_') && chatId === OWNER_ID) {
+  // Админ-кнопки (доступны тебе и младшему админу, если она не в бане)
+  if (data.startsWith('adm_') && isAdmin(chatId)) {
     if (data === 'adm_refresh') {
       await bot.answerCallbackQuery(query.id, { text: 'Обновлено' });
-      return bot.editMessageText(buildAdminText(), {
-        chat_id: OWNER_ID,
+      return bot.editMessageText(buildAdminText(chatId), {
+        chat_id: chatId,
         message_id: messageId,
-        reply_markup: buildAdminKeyboard()
+        reply_markup: buildAdminKeyboard(chatId)
       }).catch(() => {});
     }
 
     if (data === 'adm_msg_all') {
       session.step = 'AWAITING_ADMIN_BROADCAST';
       await bot.answerCallbackQuery(query.id);
-      return bot.sendMessage(OWNER_ID, '📢 Введите текст сообщения для всех клиентов (или напишите Отмена):');
+      return bot.sendMessage(chatId, '📢 Введите текст сообщения для всех клиентов (или напишите Отмена):');
     }
 
     const [action, targetIdStr] = data.split(':');
     const targetId = Number(targetIdStr);
+
+    // ЖЕСТКАЯ ЗАЩИТА: никто и никогда не может тронуть Главного Создателя (OWNER_ID)
+    if (isOwner(targetId)) {
+      return bot.answerCallbackQuery(query.id, {
+        text: '⛔ Невозможно применить это действие к Главному Создателю!',
+        show_alert: true
+      });
+    }
+
+    // Младший админ не может трогать других младших админов или саму себя
+    if (!isOwner(chatId) && isSubAdmin(targetId)) {
+      return bot.answerCallbackQuery(query.id, {
+        text: '⛔ Управлять администраторами может только Главный Создатель!',
+        show_alert: true
+      });
+    }
 
     if (action === 'adm_kick') {
       const targetSession = sessions.get(targetId);
@@ -1065,14 +1105,14 @@ bot.on('callback_query', async (query) => {
         targetSession.groupsCache = [];
       }
       clearUserAuthFolder(targetId);
-      bot.sendMessage(targetId, '⛔ Доступ к боту закрыт администратором.').catch(() => {});
+      bot.sendMessage(targetId, '⛔ Доступ к боту закрыт администратором.', getMainMenuKeyboard(targetId)).catch(() => {});
       await bot.answerCallbackQuery(query.id, { text: 'Заблокирован' });
     }
 
     if (action === 'adm_unban') {
       bannedUsers.delete(targetId);
       saveBanned();
-      bot.sendMessage(targetId, '✅ Доступ к боту открыт! Нажмите /start').catch(() => {});
+      bot.sendMessage(targetId, '✅ Доступ к боту открыт! Нажмите /start', getMainMenuKeyboard(targetId)).catch(() => {});
       await bot.answerCallbackQuery(query.id, { text: 'Разблокирован' });
     }
 
@@ -1105,10 +1145,10 @@ bot.on('callback_query', async (query) => {
       await bot.answerCallbackQuery(query.id, { text: 'Удален' });
     }
 
-    return bot.editMessageText(buildAdminText(), {
-      chat_id: OWNER_ID,
+    return bot.editMessageText(buildAdminText(chatId), {
+      chat_id: chatId,
       message_id: messageId,
-      reply_markup: buildAdminKeyboard()
+      reply_markup: buildAdminKeyboard(chatId)
     }).catch(() => {});
   }
 
@@ -1166,7 +1206,7 @@ bot.on('callback_query', async (query) => {
     return;
   }
 
-  // ==================== УПРАВЛЕНИЕ ИСКЛЮЧЕНИЯМИ (НОВЫЙ НАДЕЖНЫЙ БЛОК) ====================
+  // ==================== УПРАВЛЕНИЕ ИСКЛЮЧЕНИЯМИ ====================
   if (data.startsWith('excl_open:') || data.startsWith('b_excl_page:') || data.startsWith('excl_page:')) {
     const parts = data.split(':');
     const page = parseInt(parts[1], 10) || 0;
@@ -1222,7 +1262,7 @@ bot.on('callback_query', async (query) => {
       if (file.startsWith('auth_info_')) {
         const chatId = Number(file.replace('auth_info_', ''));
         const credsFile = path.join(__dirname, file, 'creds.json');
-        if (chatId && (!bannedUsers.has(chatId) || chatId === OWNER_ID)) {
+        if (chatId && (!bannedUsers.has(chatId) || isOwner(chatId))) {
           if (fs.existsSync(credsFile)) {
             try {
               const creds = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
