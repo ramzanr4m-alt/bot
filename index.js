@@ -756,8 +756,9 @@ async function broadcastMessage(chatId, session, targetGroups) {
       }
 
       if (i < targetGroups.length - 1) {
-        await delay(1500 + Math.floor(Math.random() * 500));
+        await delay(20000 + Math.floor(Math.random() * 1000));
       }
+
     }
 
     const resultText = `✅ Рассылка завершена!\n\n📤 Успешно: ${success}\n❌ Ошибок: ${fails}`;
