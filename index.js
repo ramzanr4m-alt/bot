@@ -22,8 +22,8 @@ const {
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_TOKEN = '9069645701:AAFl6LJQxT4bA1hRLDowJLigUbeIhJR1YcA';
 const OWNER_ID = 5846687574; // Главный администратор
-const MAX_USERS = 7;         // Максимум подключенных клиентов
-const PAGE_SIZE = 8;
+const MAX_USERS = 10;         // Максимум подключенных клиентов
+const PAGE_SIZE = 11;
 
 const logger = pino({ level: 'silent' });
 
