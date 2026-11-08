@@ -756,7 +756,7 @@ async function broadcastMessage(chatId, session, targetGroups) {
       }
 
       if (i < targetGroups.length - 1) {
-        await delay(20000 + Math.floor(Math.random() * 1000));
+        await delay(15000 + Math.floor(Math.random() * 1000));
       }
 
     }
