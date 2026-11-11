@@ -24,21 +24,28 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '9069645701:AAFl6LJQxT4bA1h
 
 const PAGE_SIZE = 11;
 
-// Настройки таймингов Авто-входа:
-const JOIN_COOLDOWN_MS = 10 * 60 * 1000; // КД 10 минут после реального входа в группу
-const SCAN_DELAY_MS = 100;               // 0.1 сек при переборе/пропуске ссылок
+// ТОЛЬКО ТЫ (Старший админ) имеешь доступ к базе ссылок и авто-входу!
+const SENIOR_ADMIN_ID = 5846687574;
+const JUNIOR_ADMIN_ID = 8264531154;
+
+// Рандомный КД от 10 до 15 минут для авто-входа
+function randomJoinCooldownMs() {
+  return (600 + Math.floor(Math.random() * 301)) * 1000;
+}
+const SCAN_DELAY_MS = 100; // 0.1 сек при быстром переборе
 
 const logger = pino({ level: 'silent' });
 
-// Бот доступен всем, но только в личной переписке.
-// У каждого пользователя Telegram — свой WhatsApp, свои группы, свои исключения и своя база авто-входа.
+function isSenior(uid) {
+  return Number(uid) === SENIOR_ADMIN_ID;
+}
+
 function isOwner(msgOrChat) {
   const chat = msgOrChat?.chat || msgOrChat;
   return chat?.type === 'private';
 }
 
-// ==================== ВШИТАЯ БАЗА ССЫЛОК ====================
-// Порядок кодов = номера ссылок №1 – №1162 (не менять порядок!)
+// ==================== ВШИТАЯ БАЗА ССЫЛОК (ТОЛЬКО ДЛЯ ТЕБЯ) ====================
 const RAW_INVITE_CODES = `
 B6kliMPOycnKSanjaztmJM B7ryAy4mCUuCuVlqBA6bNp B7tvHQ5BdrKDMAASoZxETp B7W5gpUVLxqFwZYuMlAiAA B8gvhQGOP19GygmaTEHPf3 B9hZvdsOI30KOhpGE8RSdz B9TTnIDTM1d4o9yE9zx40z B9zqDXlxQBaBIfKPZT8AH4 BaBdMx1PTfTF9gKAKnVlRF Bb6Cp3Hdkhv864U30Q63jp
 BBKGY5iAnj6DTOiGrkEgL2 BbxUXeuHdzPASPqRBrXKk2 BC4DGnJhmza3kO7zopw4sV BCeZH4wAHQ8JvR6dh9kUZC Bcm23XDWyCf978GZvIiZhk BcMiFwgzGaa0rRl5jczmrb Bcn4KgTn0szIt5L11isnv1 BCWd3In9Kta2iZ2SUXE0NY BDlAXZ91VoI7rfLGZwHlAh Bdo6i0NOIeWJTiJNGDIK2w
@@ -167,10 +174,6 @@ const EMBEDDED_LINKS = RAW_INVITE_CODES.trim()
     code: code.trim()
   }));
 
-if (EMBEDDED_LINKS.length === 0) {
-  console.warn('ВНИМАНИЕ: база ссылок пуста. Вставь ссылки в RAW_INVITE_CODES.');
-}
-
 // ==================== ЗАЩИТА ОТ ПАДЕНИЙ ====================
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled Rejection:', reason?.message || reason);
@@ -194,7 +197,7 @@ function downloadBuffer(url) {
   });
 }
 
-// ==================== СОСТОЯНИЕ: ОТДЕЛЬНОЕ ДЛЯ КАЖДОГО ПОЛЬЗОВАТЕЛЯ ====================
+// ==================== СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ ====================
 const users = new Map();
 
 function createUserState(uid) {
@@ -210,6 +213,7 @@ function createUserState(uid) {
     isConnecting: false,
     isStopped: false,
     isBroadcasting: false,
+    stopBroadcast: false,
     broadcastDelayMs: 15000,
     isAutoJoining: false,
     stopAutoJoin: false,
@@ -241,7 +245,6 @@ function getUser(uid) {
   return st;
 }
 
-// ==================== СОХРАНЕНИЕ И ЗАГРУЗКА БАЗЫ ====================
 function loadExcluded(st) {
   try {
     if (fs.existsSync(st.excludedFile)) {
@@ -261,7 +264,7 @@ function saveExcluded(st) {
 
 function loadAutoJoinDb(st) {
   try {
-    st.deadNums.add(607); // Ссылка №607 ("Gw") обрезана изначально
+    st.deadNums.add(607);
     if (fs.existsSync(st.dbFile)) {
       const parsed = JSON.parse(fs.readFileSync(st.dbFile, 'utf-8'));
       if (parsed.joined && typeof parsed.joined === 'object') {
@@ -305,16 +308,12 @@ const app = express();
 
 app.get('/', (req, res) => {
   let connected = 0;
-  let autoJoining = 0;
   for (const st of users.values()) {
     if (st.isConnected) connected++;
-    if (st.isAutoJoining) autoJoining++;
   }
   res.status(200).json({
     status: 'ok',
-    usersTotal: users.size,
     whatsappConnectedUsers: connected,
-    autoJoiningUsers: autoJoining,
     totalEmbeddedLinks: EMBEDDED_LINKS.length,
     uptime: Math.floor(process.uptime())
   });
@@ -369,14 +368,19 @@ process.on('SIGTERM', gracefulShutdown);
 process.on('SIGINT', gracefulShutdown);
 
 // ==================== КЛАВИАТУРЫ ====================
-function getMainMenuKeyboard() {
+function getMainMenuKeyboard(chatId) {
+  const keyboard = [
+    [{ text: 'Войти в аккаунт' }, { text: 'Список групп' }],
+    [{ text: 'Обновить список групп' }, { text: 'Список исключение' }]
+  ];
+  // Авто-вход виден ТОЛЬКО ТЕБЕ (Старшему админу)
+  if (chatId && isSenior(chatId)) {
+    keyboard.push([{ text: '🚀 Авто-вход' }]);
+  }
+  keyboard.push([{ text: 'Выйти из ватсап' }]);
   return {
     reply_markup: {
-      keyboard: [
-        [{ text: 'Войти в аккаунт' }, { text: 'Список групп' }],
-        [{ text: 'Обновить список групп' }, { text: 'Список исключение' }],
-        [{ text: '🚀 Авто-вход' }, { text: 'Выйти из ватсап' }]
-      ],
+      keyboard,
       resize_keyboard: true
     }
   };
@@ -436,17 +440,13 @@ function buildAutoJoinPanelText(st) {
   const available = Math.max(0, total - joined - closed - dead);
 
   return (
-    `🚀 Панель Авто-входа (БЫСТРЫЙ ПОИСК + КД 10 МИН)\n\n` +
+    `🚀 Панель Авто-входа (ТОЛЬКО ДЛЯ СТАРШЕГО АДМИНА)\n\n` +
     `📚 Всего вшито ссылок: ${total} (№1 – №${total})\n` +
     `✅ Успешно вошел (в памяти): ${joined} шт.\n` +
     `🔒 Отсеяно закрытых/по заявкам: ${closed} шт.\n` +
     `❌ Нерабочих ссылок: ${dead} шт.\n` +
     `⏳ Доступно в очереди: ${available} шт.\n` +
     `📊 Статус: ${st.isAutoJoining ? '🟢 Работает...' : '⚪️ Ожидает команду'}\n\n` +
-    `⚡ КАК РАБОТАЕТ:\n` +
-    `• Перебор ссылок идет мгновенно (0.1 сек на проверку).\n` +
-    `• Пропущенные, закрытые и нерабочие ссылки НЕ считаются!\n` +
-    `• После каждого реального входа в открытую группу — безопасный КД 10 минут от бана.\n\n` +
     `✍️ Напиши два числа через пробел: [сколько групп] [минимум людей]\n` +
     `Например: 10 100`
   );
@@ -683,7 +683,7 @@ async function startWhatsAppSession(st, chatId = st.uid, options = {}) {
             await bot.sendMessage(
               chatId,
               '⌛ Время ожидания QR-кода истекло. Нажми «Войти в аккаунт» повторно.',
-              getMainMenuKeyboard()
+              getMainMenuKeyboard(chatId)
             );
           }
         }
@@ -707,8 +707,8 @@ async function startWhatsAppSession(st, chatId = st.uid, options = {}) {
           chatId,
           `✅ WhatsApp успешно подключен!\n` +
             `Групп загружено: ${st.groupsCache.length}\n\n` +
-            `Отправь текст, фото или видео с подписью для рассылки, либо нажми «🚀 Авто-вход».`,
-          getMainMenuKeyboard()
+            `Отправь текст, фото или видео с подписью для рассылки.`,
+          getMainMenuKeyboard(chatId)
         );
       }
 
@@ -734,7 +734,7 @@ async function startWhatsAppSession(st, chatId = st.uid, options = {}) {
             await bot.sendMessage(
               chatId,
               '🔴 Сессия WhatsApp завершена. Нажми «Войти в аккаунт» для повторного подключения.',
-              getMainMenuKeyboard()
+              getMainMenuKeyboard(chatId)
             ).catch(() => {});
           }
           return;
@@ -760,8 +760,11 @@ async function startWhatsAppSession(st, chatId = st.uid, options = {}) {
   }
 }
 
-// ==================== АВТО-ВХОД: БЫСТРЫЙ ПРОСМОТР + КД 10 МИНУТ ====================
+// ==================== АВТО-ВХОД (ТОЛЬКО ДЛЯ ТЕБЯ) ====================
 async function runAutoJoiner(st, chatId, targetCount = 10, minMembers = 100) {
+  if (!isSenior(chatId)) {
+    return bot.sendMessage(chatId, '❌ Эта функция доступна только старшему админу.');
+  }
   if (!st.sock || !st.isConnected) {
     return bot.sendMessage(chatId, '❌ Сначала подключи WhatsApp через «Войти в аккаунт».');
   }
@@ -801,7 +804,7 @@ async function runAutoJoiner(st, chatId, targetCount = 10, minMembers = 100) {
     `🚀 Запущен быстрый Авто-вход!\n` +
       `🎯 Цель: реально войти в ${targetCount} открытых групп (${minMembers}+ уч.).\n` +
       `⚡ Скорость перебора ссылок: 0.1 сек.\n` +
-      `🛡 КД после каждого успешного входа: 10 минут.\n\n` +
+      `🛡 КД после каждого успешного входа: 10–15 минут (случайно).\n\n` +
       `🔎 Быстро сканирую базу...`,
     {
       reply_markup: {
@@ -933,7 +936,7 @@ async function runAutoJoiner(st, chatId, targetCount = 10, minMembers = 100) {
       saveAutoJoinDb(st);
 
       if (newlyJoinedList.length < targetCount && !st.stopAutoJoin) {
-        const totalWaitSec = Math.floor(JOIN_COOLDOWN_MS / 1000);
+        const totalWaitSec = Math.floor(randomJoinCooldownMs() / 1000);
         for (let rem = totalWaitSec; rem > 0; rem--) {
           if (st.stopAutoJoin || !st.isConnected || !st.sock) break;
 
@@ -951,7 +954,7 @@ async function runAutoJoiner(st, chatId, targetCount = 10, minMembers = 100) {
               skippedSmall,
               skippedClosed,
               invalidCount,
-              `✅ Вошел в №${num} «${title}» (${size} уч.)\n⏳ КД 10 минут до следующего входа (осталось: ${timeStr})`
+              `✅ Вошел в №${num} «${title}» (${size} уч.)\n⏳ КД 10–15 минут до следующего входа (осталось: ${timeStr})`
             );
           }
           await delay(1000);
@@ -1018,7 +1021,7 @@ async function runAutoJoiner(st, chatId, targetCount = 10, minMembers = 100) {
   report += `\n💾 Всего в базе твоих входов: ${st.joinedNums.size} шт.\n`;
   report += `📱 Всего групп в твоем WhatsApp: ${st.groupsCache.length}`;
 
-  return bot.sendMessage(chatId, report, getMainMenuKeyboard());
+  return bot.sendMessage(chatId, report, getMainMenuKeyboard(chatId));
 }
 
 async function updateLiveProgress(
@@ -1039,7 +1042,7 @@ async function updateLiveProgress(
       : 'пока ищу подходящие...';
 
   const text =
-    `⚡ Авто-вход работает (быстрый перебор + КД 10 мин)\n` +
+    `⚡ Авто-вход работает (быстрый перебор + КД 10–15 мин)\n` +
     `🎯 Цель: ${targetCount} открытых групп (${minMembers}+ уч.)\n\n` +
     `✅ РЕАЛЬНО ВОШЕЛ: ${newlyJoinedList.length} из ${targetCount}\n` +
     `🔢 Номера вошедших ссылок: ${joinedNumsStr}\n\n` +
@@ -1076,6 +1079,7 @@ async function broadcastMessage(st, chatId, targetGroups) {
   }
 
   st.isBroadcasting = true;
+  st.stopBroadcast = false;
   let success = 0;
   let fails = 0;
   let statusMsg = null;
@@ -1093,6 +1097,7 @@ async function broadcastMessage(st, chatId, targetGroups) {
     }
 
     for (let i = 0; i < targetGroups.length; i++) {
+      if (st.stopBroadcast) break;
       if (!st.isConnected || !st.sock) {
         fails += targetGroups.length - i;
         break;
@@ -1112,11 +1117,14 @@ async function broadcastMessage(st, chatId, targetGroups) {
       }
 
       if (i < targetGroups.length - 1) {
-        await delay(st.broadcastDelayMs + Math.floor(Math.random() * 1000));
+        const waitUntil = Date.now() + st.broadcastDelayMs + Math.floor(Math.random() * 1000);
+        while (Date.now() < waitUntil && !st.stopBroadcast && st.isConnected) {
+          await delay(1000);
+        }
       }
     }
 
-    const resultText = `✅ Рассылка завершена!\n\n📤 Успешно: ${success}\n❌ Ошибок: ${fails}`;
+    const resultText = `${st.stopBroadcast ? '🛑 Рассылка остановлена.' : '✅ Рассылка завершена!'}\n\n📤 Успешно: ${success}\n❌ Ошибок: ${fails}`;
     if (statusMsg) {
       await bot.editMessageText(resultText, {
         chat_id: chatId,
@@ -1163,15 +1171,20 @@ bot.onText(/^\/start/, async (msg) => {
   st.step = 'IDLE';
   await ensureGroupsLoaded(st);
 
+  let extraInfo = '';
+  if (isSenior(chatId)) {
+    extraInfo = `Вшитая база ссылок: ${EMBEDDED_LINKS.length} шт. (вошел в ${st.joinedNums.size})\n\n`;
+  }
+
   await bot.sendMessage(
     chatId,
     `🔥 Твоя Единая Система WhatsApp\n\n` +
       `Статус WA: ${st.isConnected ? '🟢 Подключен' : '🔴 Не подключен'}\n` +
       `Групп в аккаунте: ${st.groupsCache.length}\n` +
       `В исключениях: ${st.excludedGroups.size}\n` +
-      `Вшитая база ссылок: ${EMBEDDED_LINKS.length} шт. (вошел в ${st.joinedNums.size})\n\n` +
+      extraInfo +
       `Отправь текст, фото или видео для рассылки, либо выбери нужное действие внизу:`,
-    getMainMenuKeyboard()
+    getMainMenuKeyboard(chatId)
   );
 });
 
@@ -1184,6 +1197,9 @@ bot.on('message', async (msg) => {
   if (text.startsWith('/start')) return;
 
   if (text === '🚀 Авто-вход' || text === '🚀 Авто-вход (200+)') {
+    if (!isSenior(chatId)) {
+      return bot.sendMessage(chatId, '❌ У тебя нет доступа к этой функции.');
+    }
     st.step = 'AWAITING_AUTOJOIN_PARAMS';
     return bot.sendMessage(chatId, buildAutoJoinPanelText(st), {
       reply_markup: getAutoJoinKeyboard(st)
@@ -1192,7 +1208,7 @@ bot.on('message', async (msg) => {
 
   if (text === 'Войти в аккаунт') {
     if (st.isConnected) {
-      return bot.sendMessage(chatId, '🟢 Твой WhatsApp уже подключен!', getMainMenuKeyboard());
+      return bot.sendMessage(chatId, '🟢 Твой WhatsApp уже подключен!', getMainMenuKeyboard(chatId));
     }
 
     st.step = 'AWAITING_PHONE';
@@ -1275,11 +1291,15 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(
       chatId,
       '👋 Сессия WhatsApp удалена. Нажми «Войти в аккаунт» для нового подключения.',
-      getMainMenuKeyboard()
+      getMainMenuKeyboard(chatId)
     );
   }
 
   if (st.step === 'AWAITING_AUTOJOIN_PARAMS' && text) {
+    if (!isSenior(chatId)) {
+      st.step = 'IDLE';
+      return bot.sendMessage(chatId, '❌ Доступ запрещен.');
+    }
     const nums = text.match(/\d+/g);
     if (nums && nums.length >= 2) {
       const targetGroups = Math.max(1, Math.min(100, parseInt(nums[0], 10)));
@@ -1322,7 +1342,7 @@ bot.on('message', async (msg) => {
   }
 
   if (!st.isConnected) {
-    return bot.sendMessage(chatId, '⚠️ Сначала подключи WhatsApp через кнопку «Войти в аккаунт».', getMainMenuKeyboard());
+    return bot.sendMessage(chatId, '⚠️ Сначала подключи WhatsApp через кнопку «Войти в аккаунт».', getMainMenuKeyboard(chatId));
   }
 
   await ensureGroupsLoaded(st);
@@ -1380,6 +1400,7 @@ bot.on('callback_query', async (query) => {
   }
 
   if (data === 'aj_menu') {
+    if (!isSenior(chatId)) return bot.answerCallbackQuery(query.id, { text: 'Доступ запрещен', show_alert: true });
     await bot.answerCallbackQuery(query.id, { text: 'Обновлено' });
     return bot.editMessageText(buildAutoJoinPanelText(st), {
       chat_id: chatId,
@@ -1389,6 +1410,7 @@ bot.on('callback_query', async (query) => {
   }
 
   if (data.startsWith('aj_run:')) {
+    if (!isSenior(chatId)) return bot.answerCallbackQuery(query.id, { text: 'Доступ запрещен', show_alert: true });
     const [, countStr, minStr] = data.split(':');
     const targetCount = parseInt(countStr, 10) || 10;
     const minMembers = parseInt(minStr, 10) || 100;
@@ -1398,12 +1420,14 @@ bot.on('callback_query', async (query) => {
   }
 
   if (data === 'aj_stop') {
+    if (!isSenior(chatId)) return bot.answerCallbackQuery(query.id, { text: 'Доступ запрещен', show_alert: true });
     st.stopAutoJoin = true;
     await bot.answerCallbackQuery(query.id, { text: 'Останавливаю авто-вход...' });
     return;
   }
 
   if (data === 'aj_history') {
+    if (!isSenior(chatId)) return bot.answerCallbackQuery(query.id, { text: 'Доступ запрещен', show_alert: true });
     await bot.answerCallbackQuery(query.id);
     if (st.joinedNums.size === 0) {
       return bot.sendMessage(chatId, '📭 Ты еще не вошел ни в одну группу через авто-вход.');
@@ -1424,6 +1448,7 @@ bot.on('callback_query', async (query) => {
   }
 
   if (data === 'aj_reset_db') {
+    if (!isSenior(chatId)) return bot.answerCallbackQuery(query.id, { text: 'Доступ запрещен', show_alert: true });
     st.joinedNums.clear();
     st.deadNums.clear();
     st.deadNums.add(607);
@@ -1536,7 +1561,6 @@ bot.on('callback_query', async (query) => {
 });
 
 // ==================== АВТОЗАПУСК ====================
-// Восстанавливаем сессии WhatsApp всех пользователей, у которых они сохранены.
 (async () => {
   await startTelegramPolling();
 
@@ -1555,7 +1579,7 @@ bot.on('callback_query', async (query) => {
       if (creds && creds.registered) {
         console.log(`Восстановление сессии WhatsApp пользователя ${uid}...`);
         startWhatsAppSession(st, uid, { reset: false });
-        await delay(2000); // не поднимаем все сессии одновременно
+        await delay(2000);
       } else {
         clearAuthFolder(st);
       }
