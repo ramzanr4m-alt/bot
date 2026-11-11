@@ -20,29 +20,25 @@ const {
 
 // ==================== КОНФИГУРАЦИЯ ====================
 const PORT = process.env.PORT || 3000;
-const TELEGRAM_TOKEN = '9069645701:AAFl6LJQxT4bA1hRLDowJLigUbeIhJR1YcA';
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '9069645701:AAFl6LJQxT4bA1hRLDowJLigUbeIhJR1YcA';
 
-// Доступ строго для твоего аккаунта
-const ALLOWED_IDS = new Set([5846687574, 584668757]);
-const OWNER_ID = 5846687574;
 const PAGE_SIZE = 11;
 
 // Настройки таймингов Авто-входа:
-const JOIN_COOLDOWN_MS = (600 + Math.floor(Math.random() * 301)) * 1000;
- // КД 10 минут (600 000 мс) после реального входа в группу
-const SCAN_DELAY_MS = 100;               // 0.1 сек при переборе/пропуске ссылок (очень быстрый просмотр)
-
-const AUTH_DIR = path.join(__dirname, `auth_info_${OWNER_ID}`);
-const EXCLUDED_FILE = path.join(__dirname, `excluded_${OWNER_ID}.json`);
-const AUTOJOIN_DB_FILE = path.join(__dirname, `autojoin_db_${OWNER_ID}.json`);
+const JOIN_COOLDOWN_MS = 10 * 60 * 1000; // КД 10 минут после реального входа в группу
+const SCAN_DELAY_MS = 100;               // 0.1 сек при переборе/пропуске ссылок
 
 const logger = pino({ level: 'silent' });
 
-function isOwner(chatId) {
-  return ALLOWED_IDS.has(Number(chatId));
+// Бот доступен всем, но только в личной переписке.
+// У каждого пользователя Telegram — свой WhatsApp, свои группы, свои исключения и своя база авто-входа.
+function isOwner(msgOrChat) {
+  const chat = msgOrChat?.chat || msgOrChat;
+  return chat?.type === 'private';
 }
 
-// ==================== ВШИТАЯ БАЗА ВСЕХ 1162 ССЫЛОК (ТОЧНЫЙ ПОРЯДОК №1 - №1162) ====================
+// ==================== ВШИТАЯ БАЗА ССЫЛОК ====================
+// Порядок кодов = номера ссылок №1 – №1162 (не менять порядок!)
 const RAW_INVITE_CODES = `
 B6kliMPOycnKSanjaztmJM B7ryAy4mCUuCuVlqBA6bNp B7tvHQ5BdrKDMAASoZxETp B7W5gpUVLxqFwZYuMlAiAA B8gvhQGOP19GygmaTEHPf3 B9hZvdsOI30KOhpGE8RSdz B9TTnIDTM1d4o9yE9zx40z B9zqDXlxQBaBIfKPZT8AH4 BaBdMx1PTfTF9gKAKnVlRF Bb6Cp3Hdkhv864U30Q63jp
 BBKGY5iAnj6DTOiGrkEgL2 BbxUXeuHdzPASPqRBrXKk2 BC4DGnJhmza3kO7zopw4sV BCeZH4wAHQ8JvR6dh9kUZC Bcm23XDWyCf978GZvIiZhk BcMiFwgzGaa0rRl5jczmrb Bcn4KgTn0szIt5L11isnv1 BCWd3In9Kta2iZ2SUXE0NY BDlAXZ91VoI7rfLGZwHlAh Bdo6i0NOIeWJTiJNGDIK2w
@@ -165,10 +161,15 @@ LYYavnMSAe1GdlWLqsxhfy LZONLOHjshM6nZQH87fjrp
 
 const EMBEDDED_LINKS = RAW_INVITE_CODES.trim()
   .split(/\s+/)
+  .filter(Boolean)
   .map((code, idx) => ({
     num: idx + 1,
     code: code.trim()
   }));
+
+if (EMBEDDED_LINKS.length === 0) {
+  console.warn('ВНИМАНИЕ: база ссылок пуста. Вставь ссылки в RAW_INVITE_CODES.');
+}
 
 // ==================== ЗАЩИТА ОТ ПАДЕНИЙ ====================
 process.on('unhandledRejection', (reason) => {
@@ -193,116 +194,128 @@ function downloadBuffer(url) {
   });
 }
 
-// ==================== СОСТОЯНИЕ БОТА И БАЗА ПАМЯТИ ====================
-const state = {
-  sock: null,
-  isConnected: false,
-  wasEverConnected: false,
-  isConnecting: false,
-  isStopped: false,
-  isBroadcasting: false,
-  broadcastDelayMs: 15000, // Можно менять кнопкой прямо в меню рассылки (15 сек / 1 мин / 5 мин / 10 мин)
-  isAutoJoining: false,
-  stopAutoJoin: false,
-  pairingSent: false,
-  phoneNumber: null,
-  forceQr: false,
-  qrCount: 0,
-  groupsCache: [],
-  excludedGroups: new Set(),
-  // База памяти авто-входа:
-  joinedNums: new Map(), // num -> { title, size, gid, date }
-  deadNums: new Set(),   // номера битых/нерабочих ссылок
-  closedNums: new Set(), // номера закрытых чатов (где нельзя писать сразу или вход по заявке)
-  knownSizes: new Map(), // num -> { size, title }
-  step: 'IDLE',
-  draft: {
-    type: 'text',
-    text: '',
-    fileId: null
-  },
-  reconnectTimer: null
-};
+// ==================== СОСТОЯНИЕ: ОТДЕЛЬНОЕ ДЛЯ КАЖДОГО ПОЛЬЗОВАТЕЛЯ ====================
+const users = new Map();
+
+function createUserState(uid) {
+  return {
+    uid,
+    authDir: path.join(__dirname, `auth_info_${uid}`),
+    excludedFile: path.join(__dirname, `excluded_${uid}.json`),
+    dbFile: path.join(__dirname, `autojoin_db_${uid}.json`),
+
+    sock: null,
+    isConnected: false,
+    wasEverConnected: false,
+    isConnecting: false,
+    isStopped: false,
+    isBroadcasting: false,
+    broadcastDelayMs: 15000,
+    isAutoJoining: false,
+    stopAutoJoin: false,
+    pairingSent: false,
+    phoneNumber: null,
+    forceQr: false,
+    qrCount: 0,
+    groupsCache: [],
+    excludedGroups: new Set(),
+    joinedNums: new Map(),
+    deadNums: new Set(),
+    closedNums: new Set(),
+    knownSizes: new Map(),
+    step: 'IDLE',
+    draft: { type: 'text', text: '', fileId: null },
+    reconnectTimer: null
+  };
+}
+
+function getUser(uid) {
+  uid = Number(uid);
+  let st = users.get(uid);
+  if (!st) {
+    st = createUserState(uid);
+    loadExcluded(st);
+    loadAutoJoinDb(st);
+    users.set(uid, st);
+  }
+  return st;
+}
 
 // ==================== СОХРАНЕНИЕ И ЗАГРУЗКА БАЗЫ ====================
-function loadExcluded() {
+function loadExcluded(st) {
   try {
-    if (fs.existsSync(EXCLUDED_FILE)) {
-      const parsed = JSON.parse(fs.readFileSync(EXCLUDED_FILE, 'utf-8'));
+    if (fs.existsSync(st.excludedFile)) {
+      const parsed = JSON.parse(fs.readFileSync(st.excludedFile, 'utf-8'));
       if (Array.isArray(parsed)) {
-        state.excludedGroups = new Set(parsed.map((item) => String(item)));
+        st.excludedGroups = new Set(parsed.map((item) => String(item)));
       }
     }
   } catch (_) {}
 }
 
-function saveExcluded() {
+function saveExcluded(st) {
   try {
-    fs.writeFileSync(EXCLUDED_FILE, JSON.stringify([...state.excludedGroups], null, 2), 'utf-8');
+    fs.writeFileSync(st.excludedFile, JSON.stringify([...st.excludedGroups], null, 2), 'utf-8');
   } catch (_) {}
 }
 
-function loadAutoJoinDb() {
+function loadAutoJoinDb(st) {
   try {
-    state.deadNums.add(607); // Ссылка №607 ("Gw") обрезана изначально
-    if (fs.existsSync(AUTOJOIN_DB_FILE)) {
-      const parsed = JSON.parse(fs.readFileSync(AUTOJOIN_DB_FILE, 'utf-8'));
+    st.deadNums.add(607); // Ссылка №607 ("Gw") обрезана изначально
+    if (fs.existsSync(st.dbFile)) {
+      const parsed = JSON.parse(fs.readFileSync(st.dbFile, 'utf-8'));
       if (parsed.joined && typeof parsed.joined === 'object') {
         for (const [k, v] of Object.entries(parsed.joined)) {
-          state.joinedNums.set(Number(k), v);
+          st.joinedNums.set(Number(k), v);
         }
       }
       if (Array.isArray(parsed.dead)) {
-        parsed.dead.forEach((n) => state.deadNums.add(Number(n)));
+        parsed.dead.forEach((n) => st.deadNums.add(Number(n)));
       }
       if (Array.isArray(parsed.closed)) {
-        parsed.closed.forEach((n) => state.closedNums.add(Number(n)));
+        parsed.closed.forEach((n) => st.closedNums.add(Number(n)));
       }
       if (parsed.sizes && typeof parsed.sizes === 'object') {
         for (const [k, v] of Object.entries(parsed.sizes)) {
-          state.knownSizes.set(Number(k), v);
+          st.knownSizes.set(Number(k), v);
         }
       }
     }
   } catch (_) {}
 }
 
-function saveAutoJoinDb() {
+function saveAutoJoinDb(st) {
   try {
     const joinedObj = {};
-    for (const [k, v] of state.joinedNums.entries()) {
-      joinedObj[k] = v;
-    }
+    for (const [k, v] of st.joinedNums.entries()) joinedObj[k] = v;
     const sizesObj = {};
-    for (const [k, v] of state.knownSizes.entries()) {
-      sizesObj[k] = v;
-    }
+    for (const [k, v] of st.knownSizes.entries()) sizesObj[k] = v;
     const payload = {
       joined: joinedObj,
-      dead: [...state.deadNums],
-      closed: [...state.closedNums],
+      dead: [...st.deadNums],
+      closed: [...st.closedNums],
       sizes: sizesObj
     };
-    fs.writeFileSync(AUTOJOIN_DB_FILE, JSON.stringify(payload, null, 2), 'utf-8');
+    fs.writeFileSync(st.dbFile, JSON.stringify(payload, null, 2), 'utf-8');
   } catch (_) {}
 }
-
-loadExcluded();
-loadAutoJoinDb();
 
 // ==================== HTTP-СЕРВЕР ДЛЯ RENDER ====================
 const app = express();
 
 app.get('/', (req, res) => {
+  let connected = 0;
+  let autoJoining = 0;
+  for (const st of users.values()) {
+    if (st.isConnected) connected++;
+    if (st.isAutoJoining) autoJoining++;
+  }
   res.status(200).json({
     status: 'ok',
-    whatsappConnected: state.isConnected,
-    groupsCount: state.groupsCache.length,
+    usersTotal: users.size,
+    whatsappConnectedUsers: connected,
+    autoJoiningUsers: autoJoining,
     totalEmbeddedLinks: EMBEDDED_LINKS.length,
-    alreadyJoinedLinks: state.joinedNums.size,
-    closedSkippedLinks: state.closedNums.size,
-    deadSkippedLinks: state.deadNums.size,
-    autoJoining: state.isAutoJoining,
     uptime: Math.floor(process.uptime())
   });
 });
@@ -325,7 +338,7 @@ async function startTelegramPolling() {
   try {
     await bot.deleteWebHook({ drop_pending_updates: true });
     await bot.startPolling();
-    console.log('Личный Telegram-бот успешно запущен.');
+    console.log('Telegram-бот успешно запущен.');
   } catch (err) {
     console.error('Ошибка старта Telegram Polling:', err.message);
   }
@@ -374,20 +387,20 @@ function formatDelayLabel(ms) {
   return `${Math.round(ms / 1000)} сек`;
 }
 
-function getBroadcastMenuKeyboard() {
+function getBroadcastMenuKeyboard(st) {
   return {
     inline_keyboard: [
       [{ text: '🎯 Отправить в 1 группу', callback_data: 'b_one_page:0' }],
       [{ text: '🎲 Отправить в 10 групп (случайно)', callback_data: 'b_rand10' }],
       [{ text: '📢 Отправить во все группы кроме исключенных', callback_data: 'b_all' }],
-      [{ text: `⏱ КД рассылки: ${formatDelayLabel(state.broadcastDelayMs)} (нажми чтобы сменить)`, callback_data: 'b_toggle_cd' }],
+      [{ text: `⏱ КД рассылки: ${formatDelayLabel(st.broadcastDelayMs)} (нажми чтобы сменить)`, callback_data: 'b_toggle_cd' }],
       [{ text: '🚫 Настроить исключения', callback_data: 'excl_open:0:b' }]
     ]
   };
 }
 
-function getAutoJoinKeyboard() {
-  if (state.isAutoJoining) {
+function getAutoJoinKeyboard(st) {
+  if (st.isAutoJoining) {
     return {
       inline_keyboard: [
         [{ text: '🛑 Остановить авто-вход', callback_data: 'aj_stop' }],
@@ -415,11 +428,11 @@ function getAutoJoinKeyboard() {
   };
 }
 
-function buildAutoJoinPanelText() {
+function buildAutoJoinPanelText(st) {
   const total = EMBEDDED_LINKS.length;
-  const joined = state.joinedNums.size;
-  const closed = state.closedNums.size;
-  const dead = state.deadNums.size;
+  const joined = st.joinedNums.size;
+  const closed = st.closedNums.size;
+  const dead = st.deadNums.size;
   const available = Math.max(0, total - joined - closed - dead);
 
   return (
@@ -429,7 +442,7 @@ function buildAutoJoinPanelText() {
     `🔒 Отсеяно закрытых/по заявкам: ${closed} шт.\n` +
     `❌ Нерабочих ссылок: ${dead} шт.\n` +
     `⏳ Доступно в очереди: ${available} шт.\n` +
-    `📊 Статус: ${state.isAutoJoining ? '🟢 Работает...' : '⚪️ Ожидает команду'}\n\n` +
+    `📊 Статус: ${st.isAutoJoining ? '🟢 Работает...' : '⚪️ Ожидает команду'}\n\n` +
     `⚡ КАК РАБОТАЕТ:\n` +
     `• Перебор ссылок идет мгновенно (0.1 сек на проверку).\n` +
     `• Пропущенные, закрытые и нерабочие ссылки НЕ считаются!\n` +
@@ -440,10 +453,10 @@ function buildAutoJoinPanelText() {
 }
 
 // ==================== ПАГИНАЦИЯ ГРУПП И ИСКЛЮЧЕНИЙ ====================
-function buildSingleGroupKeyboard(page = 0) {
-  const available = state.groupsCache
+function buildSingleGroupKeyboard(st, page = 0) {
+  const available = st.groupsCache
     .map((g, idx) => ({ ...g, idx }))
-    .filter((g) => !state.excludedGroups.has(String(g.id)));
+    .filter((g) => !st.excludedGroups.has(String(g.id)));
 
   const totalPages = Math.max(1, Math.ceil(available.length / PAGE_SIZE));
   const currentPage = Math.min(Math.max(0, page), totalPages - 1);
@@ -467,18 +480,18 @@ function buildSingleGroupKeyboard(page = 0) {
   return { inline_keyboard: rows };
 }
 
-async function renderExclusionsMenu(chatId, page = 0, mode = 'm', messageId = null) {
-  const totalGroups = state.groupsCache.length;
+async function renderExclusionsMenu(st, chatId, page = 0, mode = 'm', messageId = null) {
+  const totalGroups = st.groupsCache.length;
   const totalPages = Math.max(1, Math.ceil(totalGroups / PAGE_SIZE));
   const currentPage = Math.min(Math.max(0, page), totalPages - 1);
   const start = currentPage * PAGE_SIZE;
-  const slice = state.groupsCache.slice(start, start + PAGE_SIZE);
+  const slice = st.groupsCache.slice(start, start + PAGE_SIZE);
 
-  const excludedCount = state.groupsCache.filter((g) => state.excludedGroups.has(String(g.id))).length;
+  const excludedCount = st.groupsCache.filter((g) => st.excludedGroups.has(String(g.id))).length;
 
   const rows = slice.map((g, i) => {
     const globalIdx = start + i;
-    const isExcl = state.excludedGroups.has(String(g.id));
+    const isExcl = st.excludedGroups.has(String(g.id));
     return [
       {
         text: `${isExcl ? '🚫 [ИСКЛ]' : '✅ [АКТИВ]'} ${g.subject.slice(0, 36)}`,
@@ -525,73 +538,80 @@ async function renderExclusionsMenu(chatId, page = 0, mode = 'm', messageId = nu
 }
 
 // ==================== ЯДРО WHATSAPP (BAILEYS) ====================
-function destroySocket() {
-  state.isStopped = true;
-  if (state.reconnectTimer) {
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
+function destroySocket(st) {
+  st.isStopped = true;
+  if (st.reconnectTimer) {
+    clearTimeout(st.reconnectTimer);
+    st.reconnectTimer = null;
   }
-  if (state.sock) {
+  if (st.sock) {
     try {
-      state.sock.ev.removeAllListeners();
-      state.sock.ws.close();
+      st.sock.ev.removeAllListeners();
+      st.sock.ws.close();
     } catch (_) {}
-    state.sock = null;
+    st.sock = null;
   }
-  state.isConnected = false;
-  state.isConnecting = false;
+  st.isConnected = false;
+  st.isConnecting = false;
 }
 
-function clearAuthFolder() {
+function clearAuthFolder(st) {
   try {
-    if (fs.existsSync(AUTH_DIR)) {
-      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    if (fs.existsSync(st.authDir)) {
+      fs.rmSync(st.authDir, { recursive: true, force: true });
     }
   } catch (_) {}
 }
 
-async function refreshGroupsCache() {
-  if (!state.sock || !state.isConnected) {
+async function refreshGroupsCache(st) {
+  if (!st.sock || !st.isConnected) {
     throw new Error('WhatsApp не подключен.');
   }
-  const participating = await state.sock.groupFetchAllParticipating();
-  state.groupsCache = Object.values(participating)
+  const participating = await st.sock.groupFetchAllParticipating();
+  st.groupsCache = Object.values(participating)
     .map((g) => ({
       id: String(g.id),
       subject: g.subject || 'Без названия',
       announce: Boolean(g.announce)
     }))
     .sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
-  return state.groupsCache;
+  return st.groupsCache;
 }
 
-async function ensureGroupsLoaded() {
-  if (state.excludedGroups.size === 0) {
-    loadExcluded();
+async function ensureGroupsLoaded(st) {
+  if (st.excludedGroups.size === 0) {
+    loadExcluded(st);
   }
-  if (state.groupsCache.length === 0 && state.isConnected) {
+  if (st.groupsCache.length === 0 && st.isConnected) {
     try {
-      await refreshGroupsCache();
+      await refreshGroupsCache(st);
     } catch (_) {}
   }
 }
 
-async function startWhatsAppSession(chatId = OWNER_ID, options = {}) {
+async function sendQrCode(chatId, qrData, caption) {
+  try {
+    const buffer = await QRCode.toBuffer(qrData, { scale: 8, margin: 2 });
+    await bot.sendPhoto(chatId, buffer, { caption });
+  } catch (_) {}
+}
+
+async function startWhatsAppSession(st, chatId = st.uid, options = {}) {
   if (options.reset) {
-    destroySocket();
-    clearAuthFolder();
-    state.pairingSent = false;
-    state.qrCount = 0;
-    state.phoneNumber = options.phoneNumber || null;
-    state.forceQr = Boolean(options.forceQr);
+    destroySocket(st);
+    clearAuthFolder(st);
+    st.pairingSent = false;
+    st.qrCount = 0;
+    st.phoneNumber = options.phoneNumber || null;
+    st.forceQr = Boolean(options.forceQr);
   }
 
-  if (state.isConnecting) return;
-  state.isConnecting = true;
-  state.isStopped = false;
+  if (st.isConnecting) return;
+  st.isConnecting = true;
+  st.isStopped = false;
 
   try {
-    const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { state: authState, saveCreds } = await useMultiFileAuthState(st.authDir);
 
     let version = [2, 3000, 1015901307];
     try {
@@ -617,22 +637,22 @@ async function startWhatsAppSession(chatId = OWNER_ID, options = {}) {
       getMessage: async () => ({ conversation: '' })
     });
 
-    state.sock = sock;
+    st.sock = sock;
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
-      if (state.isStopped) return;
+      if (st.isStopped) return;
 
       const { connection, lastDisconnect, qr } = update;
 
       if (qr && !authState.creds.registered) {
-        if (state.phoneNumber && !state.forceQr) {
-          if (!state.pairingSent) {
-            state.pairingSent = true;
+        if (st.phoneNumber && !st.forceQr) {
+          if (!st.pairingSent) {
+            st.pairingSent = true;
             try {
               await delay(1000);
-              const rawCode = await sock.requestPairingCode(state.phoneNumber);
+              const rawCode = await sock.requestPairingCode(st.phoneNumber);
               const formattedCode = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
 
               await bot.sendMessage(
@@ -649,17 +669,17 @@ async function startWhatsAppSession(chatId = OWNER_ID, options = {}) {
                 }
               );
             } catch (_) {
-              state.forceQr = true;
+              st.forceQr = true;
               await sendQrCode(chatId, qr, '⚠️ Отсканируй резервный QR-код:');
             }
           }
         } else {
-          state.qrCount++;
-          if (state.qrCount <= 3) {
-            await sendQrCode(chatId, qr, `📷 Отсканируй QR-код (${state.qrCount}/3):`);
+          st.qrCount++;
+          if (st.qrCount <= 3) {
+            await sendQrCode(chatId, qr, `📷 Отсканируй QR-код (${st.qrCount}/3):`);
           } else {
-            destroySocket();
-            clearAuthFolder();
+            destroySocket(st);
+            clearAuthFolder(st);
             await bot.sendMessage(
               chatId,
               '⌛ Время ожидания QR-кода истекло. Нажми «Войти в аккаунт» повторно.',
@@ -670,34 +690,34 @@ async function startWhatsAppSession(chatId = OWNER_ID, options = {}) {
       }
 
       if (connection === 'open') {
-        state.isConnected = true;
-        state.wasEverConnected = true;
-        state.isConnecting = false;
-        state.pairingSent = false;
-        state.phoneNumber = null;
-        state.qrCount = 0;
+        st.isConnected = true;
+        st.wasEverConnected = true;
+        st.isConnecting = false;
+        st.pairingSent = false;
+        st.phoneNumber = null;
+        st.qrCount = 0;
 
-        loadExcluded();
+        loadExcluded(st);
 
         try {
-          await refreshGroupsCache();
+          await refreshGroupsCache(st);
         } catch (_) {}
 
         await bot.sendMessage(
           chatId,
           `✅ WhatsApp успешно подключен!\n` +
-            `Групп загружено: ${state.groupsCache.length}\n\n` +
+            `Групп загружено: ${st.groupsCache.length}\n\n` +
             `Отправь текст, фото или видео с подписью для рассылки, либо нажми «🚀 Авто-вход».`,
           getMainMenuKeyboard()
         );
       }
 
       if (connection === 'close') {
-        const wasConnectedBefore = state.wasEverConnected;
-        state.isConnected = false;
-        state.isConnecting = false;
+        const wasConnectedBefore = st.wasEverConnected;
+        st.isConnected = false;
+        st.isConnecting = false;
 
-        if (state.isStopped) return;
+        if (st.isStopped) return;
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errMessage = String(lastDisconnect?.error?.message || lastDisconnect?.error || '');
@@ -705,12 +725,12 @@ async function startWhatsAppSession(chatId = OWNER_ID, options = {}) {
         const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403;
 
         if (isLoggedOut || isBadMac) {
-          destroySocket();
-          clearAuthFolder();
-          state.groupsCache = [];
+          destroySocket(st);
+          clearAuthFolder(st);
+          st.groupsCache = [];
 
           if (wasConnectedBefore) {
-            state.wasEverConnected = false;
+            st.wasEverConnected = false;
             await bot.sendMessage(
               chatId,
               '🔴 Сессия WhatsApp завершена. Нажми «Войти в аккаунт» для повторного подключения.',
@@ -721,50 +741,42 @@ async function startWhatsAppSession(chatId = OWNER_ID, options = {}) {
         }
 
         const isRegistered = Boolean(authState?.creds?.registered);
-        if (isRegistered || state.pairingSent || statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+        if (isRegistered || st.pairingSent || statusCode === DisconnectReason.restartRequired || statusCode === 515) {
           const delayMs = statusCode === DisconnectReason.restartRequired || statusCode === 515 ? 1200 : 4000;
-          state.reconnectTimer = setTimeout(() => {
-            if (!state.isStopped) {
-              startWhatsAppSession(chatId, { reset: false });
+          st.reconnectTimer = setTimeout(() => {
+            if (!st.isStopped) {
+              startWhatsAppSession(st, chatId, { reset: false });
             }
           }, delayMs);
         } else {
-          destroySocket();
-          clearAuthFolder();
+          destroySocket(st);
+          clearAuthFolder(st);
         }
       }
     });
   } catch (err) {
-    state.isConnecting = false;
+    st.isConnecting = false;
     await bot.sendMessage(chatId, `❌ Ошибка подключения: ${err.message}`).catch(() => {});
   }
 }
 
-async function sendQrCode(chatId, qrData, caption) {
-  try {
-    const buffer = await QRCode.toBuffer(qrData, { scale: 8, margin: 2 });
-    await bot.sendPhoto(chatId, buffer, { caption });
-  } catch (_) {}
-}
-
 // ==================== АВТО-ВХОД: БЫСТРЫЙ ПРОСМОТР + КД 10 МИНУТ ====================
-async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
-  if (!state.sock || !state.isConnected) {
+async function runAutoJoiner(st, chatId, targetCount = 10, minMembers = 100) {
+  if (!st.sock || !st.isConnected) {
     return bot.sendMessage(chatId, '❌ Сначала подключи WhatsApp через «Войти в аккаунт».');
   }
-  if (state.isAutoJoining) {
+  if (st.isAutoJoining) {
     return bot.sendMessage(chatId, '⏳ Авто-вход уже запущен! Дождись окончания или останови его.');
   }
 
-  await ensureGroupsLoaded();
-  const currentGroupIds = new Set(state.groupsCache.map((g) => String(g.id)));
+  await ensureGroupsLoaded(st);
+  const currentGroupIds = new Set(st.groupsCache.map((g) => String(g.id)));
 
-  // Отбираем только непроверенные ссылки
   const candidates = EMBEDDED_LINKS.filter(
     (item) =>
-      !state.joinedNums.has(item.num) &&
-      !state.deadNums.has(item.num) &&
-      !state.closedNums.has(item.num) &&
+      !st.joinedNums.has(item.num) &&
+      !st.deadNums.has(item.num) &&
+      !st.closedNums.has(item.num) &&
       item.code.length >= 20
   );
 
@@ -772,9 +784,9 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
     return bot.sendMessage(chatId, '🎉 Все доступные ссылки из базы уже проверены!');
   }
 
-  state.isAutoJoining = true;
-  state.stopAutoJoin = false;
-  state.step = 'IDLE';
+  st.isAutoJoining = true;
+  st.stopAutoJoin = false;
+  st.step = 'IDLE';
 
   const newlyJoinedList = [];
   let checkedTotal = 0;
@@ -798,7 +810,6 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
     }
   );
 
-  // Неблокирующее обновление статуса (не замедляет перебор ссылок)
   function triggerFastUiUpdate(lastAction, force = false) {
     const now = Date.now();
     if (!force && now - lastUiUpdate < 2500) return;
@@ -818,14 +829,13 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
   }
 
   for (let i = 0; i < candidates.length; i++) {
-    if (state.stopAutoJoin || !state.isConnected || !state.sock) break;
+    if (st.stopAutoJoin || !st.isConnected || !st.sock) break;
     if (newlyJoinedList.length >= targetCount) break;
 
     const { num, code } = candidates[i];
 
-    // Мгновенный пропуск по памяти (0 мс), если размер уже известен и меньше порога
-    if (state.knownSizes.has(num)) {
-      const cached = state.knownSizes.get(num);
+    if (st.knownSizes.has(num)) {
+      const cached = st.knownSizes.get(num);
       if (cached.size < minMembers) {
         skippedSmall++;
         checkedTotal++;
@@ -836,8 +846,7 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
     checkedTotal++;
 
     try {
-      // 1. Быстрый запрос инфо о группе
-      const info = await state.sock.groupGetInviteInfo(code);
+      const info = await st.sock.groupGetInviteInfo(code);
       const gid = info?.id ? String(info.id) : null;
       const title = info?.subject || `Группа №${num}`;
       const size = Number(info?.size || 0);
@@ -845,60 +854,55 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
       const isClosedChat = Boolean(info?.announce || info?.isCommunityAnnounce);
       const requiresApproval = Boolean(info?.joinApprovalMode || info?.membershipApprovalMode);
 
-      // 2. Если уже состоим в группе — пропускаем мгновенно
       if (gid && currentGroupIds.has(gid)) {
         alreadyInCount++;
-        state.joinedNums.set(num, {
+        st.joinedNums.set(num, {
           title,
           size,
           gid,
           date: new Date().toLocaleDateString('ru-RU')
         });
-        saveAutoJoinDb();
+        saveAutoJoinDb(st);
         triggerFastUiUpdate(`Уже в группе №${num}`);
         await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      // 3. Если группа закрыта для писем или по заявкам — пропускаем за 0.1 сек
       if (isClosedChat || requiresApproval) {
         skippedClosed++;
-        state.closedNums.add(num);
-        saveAutoJoinDb();
+        st.closedNums.add(num);
+        saveAutoJoinDb(st);
         triggerFastUiUpdate(`Пропуск №${num} (закрыта / по заявке)`);
         await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      state.knownSizes.set(num, { size, title });
+      st.knownSizes.set(num, { size, title });
 
-      // 4. Если мало участников — пропускаем за 0.1 сек
       if (size < minMembers) {
         skippedSmall++;
-        saveAutoJoinDb();
+        saveAutoJoinDb(st);
         triggerFastUiUpdate(`Пропуск №${num} (${size} уч. < ${minMembers})`);
         await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      // 5. Группа подходит! Входим
-      const joinedGid = await state.sock.groupAcceptInvite(code);
+      const joinedGid = await st.sock.groupAcceptInvite(code);
       const actualGid = String(joinedGid || gid || '');
 
       if (!actualGid || !actualGid.includes('@g.us')) {
         skippedClosed++;
-        state.closedNums.add(num);
-        saveAutoJoinDb();
+        st.closedNums.add(num);
+        saveAutoJoinDb(st);
         triggerFastUiUpdate(`Пропуск №${num} (требует одобрения админа)`);
         await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      // 6. Быстрая проверка: точно ли чат открыт для сообщений
       let canWriteNow = true;
       try {
         await delay(300);
-        const fullMeta = await state.sock.groupMetadata(actualGid);
+        const fullMeta = await st.sock.groupMetadata(actualGid);
         if (fullMeta && fullMeta.announce === true) {
           canWriteNow = false;
         }
@@ -906,17 +910,16 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
 
       if (!canWriteNow) {
         skippedClosed++;
-        state.closedNums.add(num);
-        saveAutoJoinDb();
+        st.closedNums.add(num);
+        saveAutoJoinDb(st);
         try {
-          await state.sock.groupLeave(actualGid);
+          await st.sock.groupLeave(actualGid);
         } catch (_) {}
         triggerFastUiUpdate(`Вышел из №${num} (чат закрыт для писем)`);
         await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      // 7. Успешный вход в открытый чат!
       const entryData = {
         title,
         size,
@@ -924,18 +927,16 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
         date: new Date().toLocaleDateString('ru-RU')
       };
 
-      state.joinedNums.set(num, entryData);
+      st.joinedNums.set(num, entryData);
       currentGroupIds.add(actualGid);
       newlyJoinedList.push({ num, title, size });
-      saveAutoJoinDb();
+      saveAutoJoinDb(st);
 
-      // Если нужно войти еще в группы — ждём КД 10 минут с живым таймером
-      if (newlyJoinedList.length < targetCount && !state.stopAutoJoin) {
+      if (newlyJoinedList.length < targetCount && !st.stopAutoJoin) {
         const totalWaitSec = Math.floor(JOIN_COOLDOWN_MS / 1000);
         for (let rem = totalWaitSec; rem > 0; rem--) {
-          if (state.stopAutoJoin || !state.isConnected || !state.sock) break;
+          if (st.stopAutoJoin || !st.isConnected || !st.sock) break;
 
-          // Обновляем таймер в сообщении сразу после входа и каждые 30 секунд
           if (rem === totalWaitSec || rem % 30 === 0) {
             const mins = Math.floor(rem / 60);
             const secs = rem % 60;
@@ -980,20 +981,20 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
         msg.includes('resource-limit') ||
         msg.includes('bad-request')
       ) {
-        state.deadNums.add(num);
+        st.deadNums.add(num);
       }
       invalidCount++;
-      saveAutoJoinDb();
+      saveAutoJoinDb(st);
       triggerFastUiUpdate(`Нерабочая ссылка №${num}`);
       await delay(SCAN_DELAY_MS);
     }
   }
 
-  const wasStopped = state.stopAutoJoin;
-  state.isAutoJoining = false;
-  state.stopAutoJoin = false;
+  const wasStopped = st.stopAutoJoin;
+  st.isAutoJoining = false;
+  st.stopAutoJoin = false;
 
-  await refreshGroupsCache().catch(() => {});
+  await refreshGroupsCache(st).catch(() => {});
 
   let report = `${wasStopped ? '🛑 Авто-вход остановлен вручную!' : '🏁 Авто-вход завершен!'}\n`;
   report += `🎯 Цель была: ${targetCount} открытых групп (${minMembers}+ уч.)\n\n`;
@@ -1014,8 +1015,8 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
   if (alreadyInCount > 0) {
     report += `• 📂 Уже состоял ранее: ${alreadyInCount}\n`;
   }
-  report += `\n💾 Всего в базе твоих входов: ${state.joinedNums.size} шт.\n`;
-  report += `📱 Всего групп в твоем WhatsApp: ${state.groupsCache.length}`;
+  report += `\n💾 Всего в базе твоих входов: ${st.joinedNums.size} шт.\n`;
+  report += `📱 Всего групп в твоем WhatsApp: ${st.groupsCache.length}`;
 
   return bot.sendMessage(chatId, report, getMainMenuKeyboard());
 }
@@ -1058,23 +1059,23 @@ async function updateLiveProgress(
 }
 
 // ==================== ФУНКЦИЯ РАССЫЛКИ ====================
-async function broadcastMessage(chatId, targetGroups) {
-  if (!state.sock || !state.isConnected) {
+async function broadcastMessage(st, chatId, targetGroups) {
+  if (!st.sock || !st.isConnected) {
     return bot.sendMessage(chatId, '❌ WhatsApp не подключен. Сначала нажми «Войти в аккаунт».');
   }
-  if (state.isBroadcasting) {
+  if (st.isBroadcasting) {
     return bot.sendMessage(chatId, '⏳ Дождись завершения текущей рассылки!');
   }
   if (targetGroups.length === 0) {
     return bot.sendMessage(chatId, '⚠️ Нет доступных групп для рассылки.');
   }
 
-  const { type, text, fileId } = state.draft;
+  const { type, text, fileId } = st.draft;
   if (type === 'text' && (!text || !text.trim())) {
     return bot.sendMessage(chatId, '⚠️ Сообщение пустое. Отправь новый текст, фото или видео.');
   }
 
-  state.isBroadcasting = true;
+  st.isBroadcasting = true;
   let success = 0;
   let fails = 0;
   let statusMsg = null;
@@ -1082,7 +1083,7 @@ async function broadcastMessage(chatId, targetGroups) {
   try {
     statusMsg = await bot.sendMessage(
       chatId,
-      `⏳ Начинаю рассылку по ${targetGroups.length} группам (КД: ${formatDelayLabel(state.broadcastDelayMs)})...`
+      `⏳ Начинаю рассылку по ${targetGroups.length} группам (КД: ${formatDelayLabel(st.broadcastDelayMs)})...`
     );
 
     let mediaBuffer = null;
@@ -1092,18 +1093,18 @@ async function broadcastMessage(chatId, targetGroups) {
     }
 
     for (let i = 0; i < targetGroups.length; i++) {
-      if (!state.isConnected || !state.sock) {
+      if (!st.isConnected || !st.sock) {
         fails += targetGroups.length - i;
         break;
       }
       const group = targetGroups[i];
       try {
         if (type === 'photo' && mediaBuffer) {
-          await state.sock.sendMessage(group.id, { image: mediaBuffer, caption: text || '' });
+          await st.sock.sendMessage(group.id, { image: mediaBuffer, caption: text || '' });
         } else if (type === 'video' && mediaBuffer) {
-          await state.sock.sendMessage(group.id, { video: mediaBuffer, caption: text || '' });
+          await st.sock.sendMessage(group.id, { video: mediaBuffer, caption: text || '' });
         } else {
-          await state.sock.sendMessage(group.id, { text: text || '' });
+          await st.sock.sendMessage(group.id, { text: text || '' });
         }
         success++;
       } catch (_) {
@@ -1111,7 +1112,7 @@ async function broadcastMessage(chatId, targetGroups) {
       }
 
       if (i < targetGroups.length - 1) {
-        await delay(state.broadcastDelayMs + Math.floor(Math.random() * 1000));
+        await delay(st.broadcastDelayMs + Math.floor(Math.random() * 1000));
       }
     }
 
@@ -1127,12 +1128,12 @@ async function broadcastMessage(chatId, targetGroups) {
   } catch (err) {
     await bot.sendMessage(chatId, `❌ Ошибка рассылки: ${err.message}`).catch(() => {});
   } finally {
-    state.isBroadcasting = false;
+    st.isBroadcasting = false;
   }
 }
 
-async function sendDraftPreview(chatId, messageId = null) {
-  const { type, text } = state.draft;
+async function sendDraftPreview(st, chatId, messageId = null) {
+  const { type, text } = st.draft;
   const header =
     type === 'photo'
       ? '🖼 Фото для рассылки сохранено!'
@@ -1145,54 +1146,56 @@ async function sendDraftPreview(chatId, messageId = null) {
     return bot.editMessageText(safePreview, {
       chat_id: chatId,
       message_id: messageId,
-      reply_markup: getBroadcastMenuKeyboard()
+      reply_markup: getBroadcastMenuKeyboard(st)
     }).catch(() => {});
   }
   return bot.sendMessage(chatId, safePreview, {
-    reply_markup: getBroadcastMenuKeyboard()
+    reply_markup: getBroadcastMenuKeyboard(st)
   });
 }
 
 // ==================== ОБРАБОТЧИКИ КОМАНД TELEGRAM ====================
 bot.onText(/^\/start/, async (msg) => {
+  if (!isOwner(msg)) return;
   const chatId = Number(msg.chat.id);
-  if (!isOwner(chatId)) return;
+  const st = getUser(chatId);
 
-  state.step = 'IDLE';
-  await ensureGroupsLoaded();
+  st.step = 'IDLE';
+  await ensureGroupsLoaded(st);
 
   await bot.sendMessage(
     chatId,
     `🔥 Твоя Единая Система WhatsApp\n\n` +
-      `Статус WA: ${state.isConnected ? '🟢 Подключен' : '🔴 Не подключен'}\n` +
-      `Групп в аккаунте: ${state.groupsCache.length}\n` +
-      `В исключениях: ${state.excludedGroups.size}\n` +
-      `Вшитая база ссылок: ${EMBEDDED_LINKS.length} шт. (вошел в ${state.joinedNums.size})\n\n` +
+      `Статус WA: ${st.isConnected ? '🟢 Подключен' : '🔴 Не подключен'}\n` +
+      `Групп в аккаунте: ${st.groupsCache.length}\n` +
+      `В исключениях: ${st.excludedGroups.size}\n` +
+      `Вшитая база ссылок: ${EMBEDDED_LINKS.length} шт. (вошел в ${st.joinedNums.size})\n\n` +
       `Отправь текст, фото или видео для рассылки, либо выбери нужное действие внизу:`,
     getMainMenuKeyboard()
   );
 });
 
 bot.on('message', async (msg) => {
+  if (!isOwner(msg)) return;
   const chatId = Number(msg.chat.id);
-  if (!isOwner(chatId)) return;
+  const st = getUser(chatId);
 
   const text = msg.text ? msg.text.trim() : '';
   if (text.startsWith('/start')) return;
 
   if (text === '🚀 Авто-вход' || text === '🚀 Авто-вход (200+)') {
-    state.step = 'AWAITING_AUTOJOIN_PARAMS';
-    return bot.sendMessage(chatId, buildAutoJoinPanelText(), {
-      reply_markup: getAutoJoinKeyboard()
+    st.step = 'AWAITING_AUTOJOIN_PARAMS';
+    return bot.sendMessage(chatId, buildAutoJoinPanelText(st), {
+      reply_markup: getAutoJoinKeyboard(st)
     });
   }
 
   if (text === 'Войти в аккаунт') {
-    if (state.isConnected) {
+    if (st.isConnected) {
       return bot.sendMessage(chatId, '🟢 Твой WhatsApp уже подключен!', getMainMenuKeyboard());
     }
 
-    state.step = 'AWAITING_PHONE';
+    st.step = 'AWAITING_PHONE';
     return bot.sendMessage(
       chatId,
       '📱 Введи свой номер телефона WhatsApp (например: 79298892099):\n\nИли нажми кнопку ниже для входа по QR-коду:',
@@ -1205,17 +1208,17 @@ bot.on('message', async (msg) => {
   }
 
   if (text === 'Список групп') {
-    state.step = 'IDLE';
-    if (!state.isConnected) return bot.sendMessage(chatId, '🔴 WhatsApp не подключен.');
-    await ensureGroupsLoaded();
-    if (state.groupsCache.length === 0) return bot.sendMessage(chatId, '📭 Группы не найдены.');
+    st.step = 'IDLE';
+    if (!st.isConnected) return bot.sendMessage(chatId, '🔴 WhatsApp не подключен.');
+    await ensureGroupsLoaded(st);
+    if (st.groupsCache.length === 0) return bot.sendMessage(chatId, '📭 Группы не найдены.');
 
-    const lines = state.groupsCache.map((g, idx) => {
-      const mark = state.excludedGroups.has(String(g.id)) ? ' 🚫 [Исключена]' : '';
+    const lines = st.groupsCache.map((g, idx) => {
+      const mark = st.excludedGroups.has(String(g.id)) ? ' 🚫 [Исключена]' : '';
       return `${idx + 1}. ${g.subject}${mark}`;
     });
 
-    let chunk = `📋 Список твоих групп (${state.groupsCache.length}):\n\n`;
+    let chunk = `📋 Список твоих групп (${st.groupsCache.length}):\n\n`;
     for (const line of lines) {
       if ((chunk + line + '\n').length > 3800) {
         await bot.sendMessage(chatId, chunk);
@@ -1228,12 +1231,12 @@ bot.on('message', async (msg) => {
   }
 
   if (text === 'Обновить список групп') {
-    state.step = 'IDLE';
-    if (!state.isConnected) return bot.sendMessage(chatId, '🔴 WhatsApp не подключен.');
+    st.step = 'IDLE';
+    if (!st.isConnected) return bot.sendMessage(chatId, '🔴 WhatsApp не подключен.');
     const waitMsg = await bot.sendMessage(chatId, '🔄 Загружаю группы из WhatsApp...');
     try {
-      await refreshGroupsCache();
-      await bot.editMessageText(`✅ Список обновлён! Групп: ${state.groupsCache.length}`, {
+      await refreshGroupsCache(st);
+      await bot.editMessageText(`✅ Список обновлён! Групп: ${st.groupsCache.length}`, {
         chat_id: chatId,
         message_id: waitMsg.message_id
       });
@@ -1247,27 +1250,27 @@ bot.on('message', async (msg) => {
   }
 
   if (text === 'Список исключение' || text === 'Список исключений') {
-    state.step = 'IDLE';
-    if (!state.isConnected) {
+    st.step = 'IDLE';
+    if (!st.isConnected) {
       return bot.sendMessage(chatId, '🔴 Сначала подключи WhatsApp через «Войти в аккаунт».');
     }
-    await ensureGroupsLoaded();
-    if (state.groupsCache.length === 0) {
+    await ensureGroupsLoaded(st);
+    if (st.groupsCache.length === 0) {
       return bot.sendMessage(chatId, '📭 В твоём WhatsApp нет доступных групп.');
     }
 
-    return renderExclusionsMenu(chatId, 0, 'm', null);
+    return renderExclusionsMenu(st, chatId, 0, 'm', null);
   }
 
   if (text === 'Выйти из ватсап') {
-    state.step = 'IDLE';
-    state.wasEverConnected = false;
-    if (state.sock) {
-      try { await state.sock.logout().catch(() => {}); } catch (_) {}
+    st.step = 'IDLE';
+    st.wasEverConnected = false;
+    if (st.sock) {
+      try { await st.sock.logout().catch(() => {}); } catch (_) {}
     }
-    destroySocket();
-    clearAuthFolder();
-    state.groupsCache = [];
+    destroySocket(st);
+    clearAuthFolder(st);
+    st.groupsCache = [];
 
     return bot.sendMessage(
       chatId,
@@ -1276,18 +1279,18 @@ bot.on('message', async (msg) => {
     );
   }
 
-  if (state.step === 'AWAITING_AUTOJOIN_PARAMS' && text) {
+  if (st.step === 'AWAITING_AUTOJOIN_PARAMS' && text) {
     const nums = text.match(/\d+/g);
     if (nums && nums.length >= 2) {
       const targetGroups = Math.max(1, Math.min(100, parseInt(nums[0], 10)));
       const minPeople = Math.max(1, parseInt(nums[1], 10));
-      state.step = 'IDLE';
-      runAutoJoiner(chatId, targetGroups, minPeople);
+      st.step = 'IDLE';
+      runAutoJoiner(st, chatId, targetGroups, minPeople);
       return;
     } else if (nums && nums.length === 1) {
       const targetGroups = Math.max(1, Math.min(100, parseInt(nums[0], 10)));
-      state.step = 'IDLE';
-      runAutoJoiner(chatId, targetGroups, 100);
+      st.step = 'IDLE';
+      runAutoJoiner(st, chatId, targetGroups, 100);
       return;
     } else {
       return bot.sendMessage(
@@ -1297,7 +1300,7 @@ bot.on('message', async (msg) => {
     }
   }
 
-  if (state.step === 'AWAITING_PHONE' && text) {
+  if (st.step === 'AWAITING_PHONE' && text) {
     let cleanPhone = text.replace(/\D/g, '');
     if (cleanPhone.length === 11 && cleanPhone.startsWith('8')) {
       cleanPhone = '7' + cleanPhone.slice(1);
@@ -1307,10 +1310,10 @@ bot.on('message', async (msg) => {
       return bot.sendMessage(chatId, '⚠️ Введи корректный номер начиная с 7 (например: 79298892099):');
     }
 
-    state.step = 'IDLE';
+    st.step = 'IDLE';
     await bot.sendMessage(chatId, `⏳ Запрашиваю код для +${cleanPhone}... Подожди 3–5 секунд.`);
 
-    await startWhatsAppSession(chatId, {
+    await startWhatsAppSession(st, chatId, {
       reset: true,
       phoneNumber: cleanPhone,
       forceQr: false
@@ -1318,71 +1321,70 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  if (!state.isConnected) {
+  if (!st.isConnected) {
     return bot.sendMessage(chatId, '⚠️ Сначала подключи WhatsApp через кнопку «Войти в аккаунт».', getMainMenuKeyboard());
   }
 
-  await ensureGroupsLoaded();
+  await ensureGroupsLoaded(st);
 
   if (msg.photo && msg.photo.length > 0) {
     const bestPhoto = msg.photo[msg.photo.length - 1];
-    state.draft = {
+    st.draft = {
       type: 'photo',
       fileId: bestPhoto.file_id,
       text: msg.caption || ''
     };
-    return sendDraftPreview(chatId);
+    return sendDraftPreview(st, chatId);
   }
 
   if (msg.video) {
-    state.draft = {
+    st.draft = {
       type: 'video',
       fileId: msg.video.file_id,
       text: msg.caption || ''
     };
-    return sendDraftPreview(chatId);
+    return sendDraftPreview(st, chatId);
   }
 
   if (text) {
-    state.draft = {
+    st.draft = {
       type: 'text',
       fileId: null,
       text
     };
-    return sendDraftPreview(chatId);
+    return sendDraftPreview(st, chatId);
   }
 });
 
 // ==================== ОБРАБОТКА INLINE-КНОПОК ====================
 bot.on('callback_query', async (query) => {
   if (!query.message) return bot.answerCallbackQuery(query.id);
+  if (!isOwner(query.message)) return bot.answerCallbackQuery(query.id);
 
   const chatId = Number(query.message.chat.id);
-  if (!isOwner(chatId)) return;
+  const st = getUser(chatId);
 
   const messageId = query.message.message_id;
   const data = query.data || '';
 
   if (data === 'noop') return bot.answerCallbackQuery(query.id);
 
-  // Переключение КД рассылки (15 сек -> 1 мин -> 5 мин -> 10 мин)
   if (data === 'b_toggle_cd') {
     const options = [15000, 60000, 300000, 600000];
-    const currentIdx = options.indexOf(state.broadcastDelayMs);
-    state.broadcastDelayMs = options[(currentIdx + 1) % options.length];
+    const currentIdx = options.indexOf(st.broadcastDelayMs);
+    st.broadcastDelayMs = options[(currentIdx + 1) % options.length];
     await bot.answerCallbackQuery(query.id, {
-      text: `КД рассылки изменен на ${formatDelayLabel(state.broadcastDelayMs)}`
+      text: `КД рассылки изменен на ${formatDelayLabel(st.broadcastDelayMs)}`
     });
-    return sendDraftPreview(chatId, messageId);
+    return sendDraftPreview(st, chatId, messageId);
   }
 
-  // Кнопки панели Авто-входа
   if (data === 'aj_menu') {
     await bot.answerCallbackQuery(query.id, { text: 'Обновлено' });
-    return bot.editMessageText(buildAutoJoinPanelText(), {
+    return bot.editMessageText(buildAutoJoinPanelText(st), {
       chat_id: chatId,
       message_id: messageId,
-      reply_markup: getAutoJoinKeyboard()
+      reply_markup: getAutoJoinKeyboard(st)
     }).catch(() => {});
   }
 
@@ -1391,23 +1393,23 @@ bot.on('callback_query', async (query) => {
     const targetCount = parseInt(countStr, 10) || 10;
     const minMembers = parseInt(minStr, 10) || 100;
     await bot.answerCallbackQuery(query.id, { text: `Запуск: ${targetCount} открытых гр. (${minMembers}+ уч.)` });
-    runAutoJoiner(chatId, targetCount, minMembers);
+    runAutoJoiner(st, chatId, targetCount, minMembers);
     return;
   }
 
   if (data === 'aj_stop') {
-    state.stopAutoJoin = true;
+    st.stopAutoJoin = true;
     await bot.answerCallbackQuery(query.id, { text: 'Останавливаю авто-вход...' });
     return;
   }
 
   if (data === 'aj_history') {
     await bot.answerCallbackQuery(query.id);
-    if (state.joinedNums.size === 0) {
+    if (st.joinedNums.size === 0) {
       return bot.sendMessage(chatId, '📭 Ты еще не вошел ни в одну группу через авто-вход.');
     }
 
-    const entries = [...state.joinedNums.entries()].sort((a, b) => a[0] - b[0]);
+    const entries = [...st.joinedNums.entries()].sort((a, b) => a[0] - b[0]);
     let chunk = `📋 История вошедших открытых ссылок (всего: ${entries.length}):\n\n`;
     for (const [num, info] of entries) {
       const line = `• Ссылка №${num} — «${info.title || 'Группа'}» (${info.size || '?'} уч.)\n`;
@@ -1422,81 +1424,78 @@ bot.on('callback_query', async (query) => {
   }
 
   if (data === 'aj_reset_db') {
-    state.joinedNums.clear();
-    state.deadNums.clear();
-    state.deadNums.add(607);
-    state.closedNums.clear();
-    state.knownSizes.clear();
-    saveAutoJoinDb();
+    st.joinedNums.clear();
+    st.deadNums.clear();
+    st.deadNums.add(607);
+    st.closedNums.clear();
+    st.knownSizes.clear();
+    saveAutoJoinDb(st);
     await bot.answerCallbackQuery(query.id, { text: 'База авто-входа полностью очищена!' });
-    return bot.editMessageText(buildAutoJoinPanelText(), {
+    return bot.editMessageText(buildAutoJoinPanelText(st), {
       chat_id: chatId,
       message_id: messageId,
-      reply_markup: getAutoJoinKeyboard()
+      reply_markup: getAutoJoinKeyboard(st)
     }).catch(() => {});
   }
 
-  // Вход по QR
   if (data === 'force_qr') {
-    state.step = 'IDLE';
+    st.step = 'IDLE';
     await bot.answerCallbackQuery(query.id, { text: 'Генерирую QR...' });
     await bot.sendMessage(chatId, '⏳ Подключаюсь для создания QR-кода...');
-    await startWhatsAppSession(chatId, { reset: true, phoneNumber: null, forceQr: true });
+    await startWhatsAppSession(st, chatId, { reset: true, phoneNumber: null, forceQr: true });
     return;
   }
 
-  await ensureGroupsLoaded();
+  await ensureGroupsLoaded(st);
 
   if (data === 'b_back') {
     await bot.answerCallbackQuery(query.id);
-    return sendDraftPreview(chatId, messageId);
+    return sendDraftPreview(st, chatId, messageId);
   }
 
-  // Выбор 1 группы
   if (data.startsWith('b_one_page:')) {
     const page = parseInt(data.split(':')[1], 10) || 0;
     await bot.answerCallbackQuery(query.id);
     return bot.editMessageText(`🎯 Выбери группу для отправки (Стр. ${page + 1}):`, {
       chat_id: chatId,
       message_id: messageId,
-      reply_markup: buildSingleGroupKeyboard(page)
+      reply_markup: buildSingleGroupKeyboard(st, page)
     }).catch(() => {});
   }
 
   if (data.startsWith('send_one:')) {
-    const group = state.groupsCache[parseInt(data.split(':')[1], 10)];
+    const group = st.groupsCache[parseInt(data.split(':')[1], 10)];
     if (!group) return bot.answerCallbackQuery(query.id, { text: 'Группа не найдена', show_alert: true });
     await bot.answerCallbackQuery(query.id, { text: 'Отправляю...' });
-    await broadcastMessage(chatId, [group]);
+    await broadcastMessage(st, chatId, [group]);
     return;
   }
 
   if (data === 'b_rand10') {
-    const available = state.groupsCache.filter((g) => !state.excludedGroups.has(String(g.id)));
+    const available = st.groupsCache.filter((g) => !st.excludedGroups.has(String(g.id)));
     const shuffled = [...available];
     for (let i = shuffled.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
     await bot.answerCallbackQuery(query.id, { text: 'Запуск рассылки в 10 групп...' });
-    await broadcastMessage(chatId, shuffled.slice(0, 10));
+    await broadcastMessage(st, chatId, shuffled.slice(0, 10));
     return;
   }
 
   if (data === 'b_all') {
-    const available = state.groupsCache.filter((g) => !state.excludedGroups.has(String(g.id)));
+    const available = st.groupsCache.filter((g) => !st.excludedGroups.has(String(g.id)));
     await bot.answerCallbackQuery(query.id, { text: 'Запуск общей рассылки...' });
-    await broadcastMessage(chatId, available);
+    await broadcastMessage(st, chatId, available);
     return;
   }
 
-  // Управление исключениями
   if (data.startsWith('excl_open:')) {
     const parts = data.split(':');
     const page = parseInt(parts[1], 10) || 0;
     const mode = parts[2] || 'm';
     await bot.answerCallbackQuery(query.id);
-    return renderExclusionsMenu(chatId, page, mode, messageId);
+    return renderExclusionsMenu(st, chatId, page, mode, messageId);
   }
 
   if (data.startsWith('excl_tog:')) {
@@ -1505,22 +1504,22 @@ bot.on('callback_query', async (query) => {
     const page = parseInt(parts[2], 10) || 0;
     const mode = parts[3] || 'm';
 
-    const group = state.groupsCache[idx];
+    const group = st.groupsCache[idx];
     if (!group) {
       return bot.answerCallbackQuery(query.id, { text: 'Группа не найдена, обнови список' });
     }
 
     const gid = String(group.id);
-    if (state.excludedGroups.has(gid)) {
-      state.excludedGroups.delete(gid);
+    if (st.excludedGroups.has(gid)) {
+      st.excludedGroups.delete(gid);
       await bot.answerCallbackQuery(query.id, { text: '✅ Возвращена в рассылку' });
     } else {
-      state.excludedGroups.add(gid);
+      st.excludedGroups.add(gid);
       await bot.answerCallbackQuery(query.id, { text: '🚫 Добавлена в исключения' });
     }
-    saveExcluded();
+    saveExcluded(st);
 
-    return renderExclusionsMenu(chatId, page, mode, messageId);
+    return renderExclusionsMenu(st, chatId, page, mode, messageId);
   }
 
   if (data.startsWith('excl_clear:')) {
@@ -1528,30 +1527,38 @@ bot.on('callback_query', async (query) => {
     const page = parseInt(parts[1], 10) || 0;
     const mode = parts[2] || 'm';
 
-    state.excludedGroups.clear();
-    saveExcluded();
+    st.excludedGroups.clear();
+    saveExcluded(st);
     await bot.answerCallbackQuery(query.id, { text: '✅ Все исключения очищены!' });
 
-    return renderExclusionsMenu(chatId, page, mode, messageId);
+    return renderExclusionsMenu(st, chatId, page, mode, messageId);
   }
 });
 
 // ==================== АВТОЗАПУСК ====================
+// Восстанавливаем сессии WhatsApp всех пользователей, у которых они сохранены.
 (async () => {
   await startTelegramPolling();
 
+  let dirs = [];
   try {
-    const credsFile = path.join(AUTH_DIR, 'creds.json');
-    if (fs.existsSync(credsFile)) {
+    dirs = fs.readdirSync(__dirname).filter((name) => /^auth_info_\d+$/.test(name));
+  } catch (_) {}
+
+  for (const name of dirs) {
+    const uid = Number(name.replace('auth_info_', ''));
+    try {
+      const credsFile = path.join(__dirname, name, 'creds.json');
+      if (!fs.existsSync(credsFile)) continue;
       const creds = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
+      const st = getUser(uid);
       if (creds && creds.registered) {
-        console.log('Восстановление твоей сессии WhatsApp...');
-        startWhatsAppSession(OWNER_ID, { reset: false });
+        console.log(`Восстановление сессии WhatsApp пользователя ${uid}...`);
+        startWhatsAppSession(st, uid, { reset: false });
+        await delay(2000); // не поднимаем все сессии одновременно
       } else {
-        clearAuthFolder();
+        clearAuthFolder(st);
       }
-    }
-  } catch (_) {
-    clearAuthFolder();
+    } catch (_) {}
   }
 })();
