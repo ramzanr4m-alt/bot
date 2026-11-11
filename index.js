@@ -282,26 +282,27 @@ function getFinderKeyboard(s) {
     inline_keyboard: [
       [{ text: '🔎 10 групп (100+ уч.)', callback_data: 'f_run:10:100' }, { text: '🔎 10 групп (300+ уч.)', callback_data: 'f_run:10:300' }],
       [{ text: '🔎 10 групп (500+ уч.)', callback_data: 'f_run:10:500' }, { text: '🔎 20 групп (500+ уч.)', callback_data: 'f_run:20:500' }],
-      [{ text: '♻️ Сбросить выданные ссылки', callback_data: 'f_reset_shown' }]
+      [{ text: '♻️ Сбросить историю показанных', callback_data: 'f_reset_shown' }]
     ]
   };
 }
 
 function buildFinderPanelText() {
-  let shown = 0, closed = 0, dead = 0;
+  let shown = 0, onlyAdmins = 0, dead = 0;
   for (const v of knownGroups.values()) {
     if (v.dead) dead++;
-    else if (v.closed) closed++;
+    else if (v.onlyAdmins) onlyAdmins++;
     else if (v.shown) shown++;
   }
-  const avail = Math.max(0, EMBEDDED_LINKS.length - shown - closed - dead);
+  const avail = Math.max(0, EMBEDDED_LINKS.length - shown - onlyAdmins - dead);
   return (
-    `🔎 Поиск открытых групп (без авто-входа)\n\n` +
+    `🔎 Поиск групп (🟢 Открытые + 🟡 По запросу)\n\n` +
     `📚 Всего в базе: ${EMBEDDED_LINKS.length} шт.\n` +
-    `✅ Уже выдано тебе: ${shown} шт.\n` +
-    `🔒 Закрытых/по заявке: ${closed} шт.\n` +
-    `❌ Нерабочих: ${dead} шт.\n` +
-    `⏳ Доступно для поиска: ${avail} шт.\n\n` +
+    `👁 Уже показано тебе (скрыты): ${shown} шт.\n` +
+    `🔒 Только для админов (отсев): ${onlyAdmins} шт.\n` +
+    `❌ Нерабочих ссылок: ${dead} шт.\n` +
+    `⏳ Доступно новых в очереди: ${avail} шт.\n\n` +
+    `ℹ️ Уже показанные группы повторно НЕ выводятся!\n` +
     `✍️ Напиши два числа через пробел: [сколько групп] [минимум людей]\nНапример: 10 500`
   );
 }
@@ -495,12 +496,14 @@ async function runGroupFinder(chatId, targetCount = 10, minMembers = 500) {
   const myGroups = new Set(s.groupsCache.map((g) => String(g.id)));
 
   s.isSearching = true; s.stopSearch = false; s.step = 'IDLE';
-  const found = [];
-  let checked = 0, small = 0, closed = 0, dead = 0, lastUi = 0;
+  const foundOpen = [];
+  const foundRequest = [];
+  const totalFound = () => foundOpen.length + foundRequest.length;
+  let checked = 0, small = 0, locked = 0, dead = 0, lastUi = 0;
 
   const statusMsg = await bot.sendMessage(
     chatId,
-    `🔎 Ищу ${targetCount} открытых групп (${minMembers}+ уч.)...`,
+    `🔎 Ищу ${targetCount} новых групп (${minMembers}+ уч.)...\nРазделяю на 🟢 Открытые и 🟡 По запросу.`,
     { reply_markup: { inline_keyboard: [[{ text: '🛑 Остановить поиск', callback_data: 'f_stop' }]] } }
   ).catch(() => null);
 
@@ -510,17 +513,17 @@ async function runGroupFinder(chatId, targetCount = 10, minMembers = 500) {
     if (!force && now - lastUi < 2500) return;
     lastUi = now;
     bot.editMessageText(
-      `🔎 Поиск открытых групп (${minMembers}+ уч.)\n\n` +
-      `✅ Найдено: ${found.length} из ${targetCount}\n` +
+      `🔎 Поиск новых групп (${minMembers}+ уч.)\n\n` +
+      `✅ Найдено: ${totalFound()} из ${targetCount} (🟢 ${foundOpen.length} | 🟡 ${foundRequest.length})\n` +
       `📊 Проверено: ${checked} | Мелких: ${small}\n` +
-      `🔒 Закрытых: ${closed} | ❌ Битых: ${dead}\n\n📌 ${act}`,
+      `🔒 Только админы: ${locked} | ❌ Битых: ${dead}\n\n📌 ${act}`,
       { chat_id: chatId, message_id: statusMsg.message_id, reply_markup: { inline_keyboard: [[{ text: '🛑 Остановить поиск', callback_data: 'f_stop' }]] } }
     ).catch(() => {});
   }
 
   for (let i = 0; i < EMBEDDED_LINKS.length; i++) {
     if (s.stopSearch || !s.isConnected || !s.sock) break;
-    if (found.length >= targetCount) break;
+    if (totalFound() >= targetCount) break;
 
     const { num, code } = EMBEDDED_LINKS[i];
     if (code.length < 20) { knownGroups.set(num, { dead: true }); dead++; continue; }
@@ -528,13 +531,21 @@ async function runGroupFinder(chatId, targetCount = 10, minMembers = 500) {
     if (knownGroups.has(num)) {
       const c = knownGroups.get(num);
       if (c.dead) { dead++; continue; }
-      if (c.closed) { closed++; continue; }
-      if (c.shown || (c.gid && myGroups.has(c.gid))) continue;
-      if (typeof c.size === 'number' && c.size < minMembers) { small++; continue; }
-      if (c.open && c.size >= minMembers) {
+      if (c.onlyAdmins) { locked++; continue; }
+      if (c.shown) continue;
+      if (c.gid && myGroups.has(c.gid)) {
         c.shown = true;
         knownGroups.set(num, c);
-        found.push({ num, title: c.title || `Группа №${num}`, size: c.size, link: `https://chat.whatsapp.com/${code}` });
+        continue;
+      }
+      if (typeof c.size === 'number' && c.canWrite) {
+        if (c.size < minMembers) { small++; continue; }
+        c.shown = true;
+        knownGroups.set(num, c);
+        saveKnown();
+        const item = { num, title: c.title || `Группа №${num}`, size: c.size, link: `https://chat.whatsapp.com/${code}` };
+        if (c.isRequest) foundRequest.push(item);
+        else foundOpen.push(item);
         continue;
       }
     }
@@ -545,32 +556,36 @@ async function runGroupFinder(chatId, targetCount = 10, minMembers = 500) {
       const gid = info?.id ? String(info.id) : '';
       const title = (info?.subject || `Группа №${num}`).replace(/\r?\n/g, ' ').trim();
       const size = Number(info?.size || 0);
-      const isClosed = Boolean(info?.announce || info?.isCommunityAnnounce || info?.joinApprovalMode || info?.membershipApprovalMode);
+      const onlyAdmins = Boolean(info?.announce || info?.isCommunityAnnounce);
+      const isRequest = Boolean(info?.joinApprovalMode || info?.membershipApprovalMode);
 
       if (gid && myGroups.has(gid)) {
-        knownGroups.set(num, { open: !isClosed, size, title, gid, shown: true });
+        knownGroups.set(num, { canWrite: !onlyAdmins, onlyAdmins, isRequest, size, title, gid, shown: true });
+        saveKnown();
         await delay(SCAN_DELAY_MS);
         continue;
       }
-      if (isClosed) {
-        closed++;
-        knownGroups.set(num, { closed: true, size, title, gid });
-        updUi(`Закрыта №${num}`);
+      if (onlyAdmins) {
+        locked++;
+        knownGroups.set(num, { onlyAdmins: true, size, title, gid });
+        updUi(`Закрыта для писем №${num}`);
         await delay(SCAN_DELAY_MS);
         continue;
       }
       if (size < minMembers) {
         small++;
-        knownGroups.set(num, { open: true, size, title, gid, shown: false });
+        knownGroups.set(num, { canWrite: true, onlyAdmins: false, isRequest, size, title, gid, shown: false });
         updUi(`Мало людей №${num} (${size} уч.)`);
         await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      knownGroups.set(num, { open: true, size, title, gid, shown: true });
-      found.push({ num, title, size, link: `https://chat.whatsapp.com/${code}` });
+      knownGroups.set(num, { canWrite: true, onlyAdmins: false, isRequest, size, title, gid, shown: true });
+      const item = { num, title, size, link: `https://chat.whatsapp.com/${code}` };
+      if (isRequest) foundRequest.push(item);
+      else foundOpen.push(item);
       saveKnown();
-      updUi(`✅ Найдена №${num} (${size} уч.)`, true);
+      updUi(`${isRequest ? '🟡 По запросу' : '🟢 Открытая'} №${num} (${size} уч.)`, true);
       await delay(SCAN_DELAY_MS);
     } catch (err) {
       const m = String(err?.message || err || '');
@@ -586,21 +601,32 @@ async function runGroupFinder(chatId, targetCount = 10, minMembers = 500) {
   saveKnown();
   s.isSearching = false; s.stopSearch = false;
 
-  if (!found.length) {
-    return bot.sendMessage(chatId, `🏁 Поиск завершён. Подходящих открытых групп (${minMembers}+ уч.) не найдено.`, getMainMenuKeyboard(chatId)).catch(() => {});
+  if (!totalFound()) {
+    return bot.sendMessage(chatId, `🏁 Поиск завершён. Новых групп (${minMembers}+ уч.) больше не найдено.`, getMainMenuKeyboard(chatId)).catch(() => {});
   }
 
-  let chunk = `✅ Найдено открытых групп: ${found.length} (от ${minMembers}+ уч.)\n\n`;
-  for (let idx = 0; idx < found.length; idx++) {
-    const g = found[idx];
-    const line = `${idx + 1}. [Ссылка №${g.num}] ${g.title}\n👥 Участников: ${g.size}\n🔗 ${g.link}\n\n`;
-    if ((chunk + line).length > 3800) {
-      await bot.sendMessage(chatId, chunk, { disable_web_page_preview: true }).catch(() => {});
-      chunk = '';
+  async function sendListSection(headerTitle, list) {
+    if (!list.length) return;
+    let chunk = `${headerTitle} (${list.length} шт.):\n\n`;
+    for (let idx = 0; idx < list.length; idx++) {
+      const g = list[idx];
+      const line = `${idx + 1}. [№${g.num}] ${g.title}\n👥 Участников: ${g.size}\n🔗 ${g.link}\n\n`;
+      if ((chunk + line).length > 3800) {
+        await bot.sendMessage(chatId, chunk, { disable_web_page_preview: true }).catch(() => {});
+        chunk = '';
+      }
+      chunk += line;
     }
-    chunk += line;
+    if (chunk) await bot.sendMessage(chatId, chunk, { disable_web_page_preview: true }).catch(() => {});
   }
-  if (chunk) await bot.sendMessage(chatId, chunk, { disable_web_page_preview: true, ...getMainMenuKeyboard(chatId) }).catch(() => {});
+
+  await sendListSection(`🟢 ОТКРЫТЫЕ ГРУППЫ (прямой вход, ${minMembers}+ уч.)`, foundOpen);
+  await sendListSection(`🟡 ГРУППЫ ПО ЗАПРОСУ (вход по заявке, ${minMembers}+ уч.)`, foundRequest);
+  await bot.sendMessage(
+    chatId,
+    `🏁 Готово! Выдано новых групп: ${totalFound()} (🟢 Открытых: ${foundOpen.length} | 🟡 По запросу: ${foundRequest.length}).\nВсе они сохранены в базу и больше повторно показываться не будут.`,
+    getMainMenuKeyboard(chatId)
+  ).catch(() => {});
 }
 
 async function broadcastMessage(chatId, s, targets) {
@@ -810,7 +836,7 @@ bot.on('callback_query', async (q) => {
       if (v.shown) { v.shown = false; knownGroups.set(k, v); }
     }
     saveKnown();
-    await bot.answerCallbackQuery(q.id, { text: 'Выданные ссылки сброшены!' }).catch(() => {});
+    await bot.answerCallbackQuery(q.id, { text: 'История показанных сброшена!' }).catch(() => {});
     return bot.editMessageText(buildFinderPanelText(), { chat_id: id, message_id: msgId, reply_markup: getFinderKeyboard(s) }).catch(() => {});
   }
 
