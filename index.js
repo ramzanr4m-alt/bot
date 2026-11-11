@@ -27,6 +27,11 @@ const ALLOWED_IDS = new Set([5846687574, 584668757]);
 const OWNER_ID = 5846687574;
 const PAGE_SIZE = 11;
 
+// Настройки таймингов Авто-входа:
+const JOIN_COOLDOWN_MS = (600 + Math.floor(Math.random() * 301)) * 1000;
+ // КД 10 минут (600 000 мс) после реального входа в группу
+const SCAN_DELAY_MS = 100;               // 0.1 сек при переборе/пропуске ссылок (очень быстрый просмотр)
+
 const AUTH_DIR = path.join(__dirname, `auth_info_${OWNER_ID}`);
 const EXCLUDED_FILE = path.join(__dirname, `excluded_${OWNER_ID}.json`);
 const AUTOJOIN_DB_FILE = path.join(__dirname, `autojoin_db_${OWNER_ID}.json`);
@@ -196,6 +201,7 @@ const state = {
   isConnecting: false,
   isStopped: false,
   isBroadcasting: false,
+  broadcastDelayMs: 15000, // Можно менять кнопкой прямо в меню рассылки (15 сек / 1 мин / 5 мин / 10 мин)
   isAutoJoining: false,
   stopAutoJoin: false,
   pairingSent: false,
@@ -363,12 +369,18 @@ function getMainMenuKeyboard() {
   };
 }
 
+function formatDelayLabel(ms) {
+  if (ms >= 60000) return `${Math.round(ms / 60000)} мин`;
+  return `${Math.round(ms / 1000)} сек`;
+}
+
 function getBroadcastMenuKeyboard() {
   return {
     inline_keyboard: [
       [{ text: '🎯 Отправить в 1 группу', callback_data: 'b_one_page:0' }],
       [{ text: '🎲 Отправить в 10 групп (случайно)', callback_data: 'b_rand10' }],
       [{ text: '📢 Отправить во все группы кроме исключенных', callback_data: 'b_all' }],
+      [{ text: `⏱ КД рассылки: ${formatDelayLabel(state.broadcastDelayMs)} (нажми чтобы сменить)`, callback_data: 'b_toggle_cd' }],
       [{ text: '🚫 Настроить исключения', callback_data: 'excl_open:0:b' }]
     ]
   };
@@ -411,16 +423,17 @@ function buildAutoJoinPanelText() {
   const available = Math.max(0, total - joined - closed - dead);
 
   return (
-    `🚀 Панель умного Авто-входа (ТОЛЬКО ОТКРЫТЫЕ ЧАТЫ)\n\n` +
+    `🚀 Панель Авто-входа (БЫСТРЫЙ ПОИСК + КД 10 МИН)\n\n` +
     `📚 Всего вшито ссылок: ${total} (№1 – №${total})\n` +
     `✅ Успешно вошел (в памяти): ${joined} шт.\n` +
     `🔒 Отсеяно закрытых/по заявкам: ${closed} шт.\n` +
     `❌ Нерабочих ссылок: ${dead} шт.\n` +
     `⏳ Доступно в очереди: ${available} шт.\n` +
-    `📊 Статус: ${state.isAutoJoining ? '🟢 Идет поиск и вход...' : '⚪️ Ожидает команду'}\n\n` +
-    `⚡ ПРАВИЛА ЭТОГО РЕЖИМА:\n` +
-    `1. Заходит ТОЛЬКО в чаты, где можно писать прямо сейчас.\n` +
-    `2. Пропущенные, мелкие, закрытые и нерабочие ссылки НЕ считаются! Если укажешь 10 групп — бот не остановится, пока реально не войдет в 10 открытых групп.\n\n` +
+    `📊 Статус: ${state.isAutoJoining ? '🟢 Работает...' : '⚪️ Ожидает команду'}\n\n` +
+    `⚡ КАК РАБОТАЕТ:\n` +
+    `• Перебор ссылок идет мгновенно (0.1 сек на проверку).\n` +
+    `• Пропущенные, закрытые и нерабочие ссылки НЕ считаются!\n` +
+    `• После каждого реального входа в открытую группу — безопасный КД 10 минут от бана.\n\n` +
     `✍️ Напиши два числа через пробел: [сколько групп] [минимум людей]\n` +
     `Например: 10 100`
   );
@@ -734,7 +747,7 @@ async function sendQrCode(chatId, qrData, caption) {
   } catch (_) {}
 }
 
-// ==================== АВТО-ВХОД: ТОЛЬКО ОТКРЫТЫЕ ЧАТЫ И ЧЕСТНЫЙ СЧЁТЧИК ====================
+// ==================== АВТО-ВХОД: БЫСТРЫЙ ПРОСМОТР + КД 10 МИНУТ ====================
 async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
   if (!state.sock || !state.isConnected) {
     return bot.sendMessage(chatId, '❌ Сначала подключи WhatsApp через «Войти в аккаунт».');
@@ -746,7 +759,7 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
   await ensureGroupsLoaded();
   const currentGroupIds = new Set(state.groupsCache.map((g) => String(g.id)));
 
-  // Отбираем ссылки, в которые еще НЕ входили, которые НЕ закрыты и НЕ мертвы
+  // Отбираем только непроверенные ссылки
   const candidates = EMBEDDED_LINKS.filter(
     (item) =>
       !state.joinedNums.has(item.num) &&
@@ -763,20 +776,21 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
   state.stopAutoJoin = false;
   state.step = 'IDLE';
 
-  // В этот массив попадают ТОЛЬКО реально вошедшие открытые группы, где можно писать прямо сейчас!
   const newlyJoinedList = [];
   let checkedTotal = 0;
   let skippedSmall = 0;
   let skippedClosed = 0;
   let invalidCount = 0;
   let alreadyInCount = 0;
+  let lastUiUpdate = 0;
 
   const statusMsg = await bot.sendMessage(
     chatId,
-    `🚀 Запущен Авто-вход (ТОЛЬКО ОТКРЫТЫЕ ЧАТЫ)!\n` +
+    `🚀 Запущен быстрый Авто-вход!\n` +
       `🎯 Цель: реально войти в ${targetCount} открытых групп (${minMembers}+ уч.).\n` +
-      `ℹ️ Пропущенные, закрытые и нерабочие ссылки НЕ считаются в цель.\n\n` +
-      `🔎 Начинаю проверку по базе...`,
+      `⚡ Скорость перебора ссылок: 0.1 сек.\n` +
+      `🛡 КД после каждого успешного входа: 10 минут.\n\n` +
+      `🔎 Быстро сканирую базу...`,
     {
       reply_markup: {
         inline_keyboard: [[{ text: '🛑 Остановить авто-вход', callback_data: 'aj_stop' }]]
@@ -784,14 +798,32 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
     }
   );
 
+  // Неблокирующее обновление статуса (не замедляет перебор ссылок)
+  function triggerFastUiUpdate(lastAction, force = false) {
+    const now = Date.now();
+    if (!force && now - lastUiUpdate < 2500) return;
+    lastUiUpdate = now;
+    updateLiveProgress(
+      chatId,
+      statusMsg.message_id,
+      targetCount,
+      minMembers,
+      newlyJoinedList,
+      checkedTotal,
+      skippedSmall,
+      skippedClosed,
+      invalidCount,
+      lastAction
+    );
+  }
+
   for (let i = 0; i < candidates.length; i++) {
     if (state.stopAutoJoin || !state.isConnected || !state.sock) break;
-    // Цикл идет строго до тех пор, пока реально не зайдем в targetCount открытых групп!
     if (newlyJoinedList.length >= targetCount) break;
 
     const { num, code } = candidates[i];
 
-    // Быстрый пропуск по кэшу размера, если раньше уже проверяли эту группу и она меньше порога
+    // Мгновенный пропуск по памяти (0 мс), если размер уже известен и меньше порога
     if (state.knownSizes.has(num)) {
       const cached = state.knownSizes.get(num);
       if (cached.size < minMembers) {
@@ -804,18 +836,16 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
     checkedTotal++;
 
     try {
-      // 1. Запрашиваем данные о группе перед входом
+      // 1. Быстрый запрос инфо о группе
       const info = await state.sock.groupGetInviteInfo(code);
       const gid = info?.id ? String(info.id) : null;
       const title = info?.subject || `Группа №${num}`;
       const size = Number(info?.size || 0);
 
-      // Признаки того, что писать здесь и сейчас НЕЛЬЗЯ:
-      // announce = только для админов; joinApprovalMode = вход только после одобрения заявки админом
       const isClosedChat = Boolean(info?.announce || info?.isCommunityAnnounce);
       const requiresApproval = Boolean(info?.joinApprovalMode || info?.membershipApprovalMode);
 
-      // 2. Если мы уже состоим в этой группе — запоминаем и идем дальше (НЕ считаем за новый вход)
+      // 2. Если уже состоим в группе — пропускаем мгновенно
       if (gid && currentGroupIds.has(gid)) {
         alreadyInCount++;
         state.joinedNums.set(num, {
@@ -825,84 +855,55 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
           date: new Date().toLocaleDateString('ru-RU')
         });
         saveAutoJoinDb();
-        await delay(2000);
+        triggerFastUiUpdate(`Уже в группе №${num}`);
+        await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      // 3. Если в группе нельзя писать (закрыта админами) или вход по заявке — пропускаем!
+      // 3. Если группа закрыта для писем или по заявкам — пропускаем за 0.1 сек
       if (isClosedChat || requiresApproval) {
         skippedClosed++;
         state.closedNums.add(num);
         saveAutoJoinDb();
-
-        if (checkedTotal % 5 === 0) {
-          await updateLiveProgress(
-            chatId,
-            statusMsg.message_id,
-            targetCount,
-            minMembers,
-            newlyJoinedList,
-            checkedTotal,
-            skippedSmall,
-            skippedClosed,
-            invalidCount,
-            `Пропущена №${num} (закрытый чат / вход по заявке)`
-          );
-        }
-        await delay(2500);
+        triggerFastUiUpdate(`Пропуск №${num} (закрыта / по заявке)`);
+        await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      // Сохраняем размер открытой группы в кэш
       state.knownSizes.set(num, { size, title });
 
-      // 4. Если участников меньше чем нужно — пропускаем (НЕ считаем как группу)
+      // 4. Если мало участников — пропускаем за 0.1 сек
       if (size < minMembers) {
         skippedSmall++;
         saveAutoJoinDb();
-
-        if (checkedTotal % 5 === 0) {
-          await updateLiveProgress(
-            chatId,
-            statusMsg.message_id,
-            targetCount,
-            minMembers,
-            newlyJoinedList,
-            checkedTotal,
-            skippedSmall,
-            skippedClosed,
-            invalidCount,
-            `Пропущена №${num} (мало людей: ${size} уч.)`
-          );
-        }
-        await delay(2500);
+        triggerFastUiUpdate(`Пропуск №${num} (${size} уч. < ${minMembers})`);
+        await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      // 5. Пробуем войти в открытую группу
+      // 5. Группа подходит! Входим
       const joinedGid = await state.sock.groupAcceptInvite(code);
       const actualGid = String(joinedGid || gid || '');
 
-      // Если WhatsApp не вернул JID группы (значит отправилась заявка админу, а не прямой вход)
       if (!actualGid || !actualGid.includes('@g.us')) {
         skippedClosed++;
         state.closedNums.add(num);
         saveAutoJoinDb();
-        await delay(3000);
+        triggerFastUiUpdate(`Пропуск №${num} (требует одобрения админа)`);
+        await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      // 6. Контрольная проверка после входа: точно ли можно писать прямо сейчас?
+      // 6. Быстрая проверка: точно ли чат открыт для сообщений
       let canWriteNow = true;
       try {
-        await delay(1500);
+        await delay(300);
         const fullMeta = await state.sock.groupMetadata(actualGid);
         if (fullMeta && fullMeta.announce === true) {
           canWriteNow = false;
         }
       } catch (_) {}
 
-      // Если группа внутри оказалась закрытой для сообщений — выходим из неё и НЕ засчитываем!
       if (!canWriteNow) {
         skippedClosed++;
         state.closedNums.add(num);
@@ -910,11 +911,12 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
         try {
           await state.sock.groupLeave(actualGid);
         } catch (_) {}
-        await delay(3000);
+        triggerFastUiUpdate(`Вышел из №${num} (чат закрыт для писем)`);
+        await delay(SCAN_DELAY_MS);
         continue;
       }
 
-      // 7. Чат 100% открытый, людей достаточно, мы внутри и можем писать прямо сейчас! Засчитываем!
+      // 7. Успешный вход в открытый чат!
       const entryData = {
         title,
         size,
@@ -927,23 +929,45 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
       newlyJoinedList.push({ num, title, size });
       saveAutoJoinDb();
 
-      await updateLiveProgress(
-        chatId,
-        statusMsg.message_id,
-        targetCount,
-        minMembers,
-        newlyJoinedList,
-        checkedTotal,
-        skippedSmall,
-        skippedClosed,
-        invalidCount,
-        `✅ Вошел в №${num} «${title}» (${size} уч.)`
-      );
-
-      // Пауза 45–65 секунд только после РЕАЛЬНОГО успешного входа
+      // Если нужно войти еще в группы — ждём КД 10 минут с живым таймером
       if (newlyJoinedList.length < targetCount && !state.stopAutoJoin) {
-        const waitMs = 45000 + Math.floor(Math.random() * 20000);
-        await delay(waitMs);
+        const totalWaitSec = Math.floor(JOIN_COOLDOWN_MS / 1000);
+        for (let rem = totalWaitSec; rem > 0; rem--) {
+          if (state.stopAutoJoin || !state.isConnected || !state.sock) break;
+
+          // Обновляем таймер в сообщении сразу после входа и каждые 30 секунд
+          if (rem === totalWaitSec || rem % 30 === 0) {
+            const mins = Math.floor(rem / 60);
+            const secs = rem % 60;
+            const timeStr = `${mins} мин ${secs < 10 ? '0' : ''}${secs} сек`;
+            await updateLiveProgress(
+              chatId,
+              statusMsg.message_id,
+              targetCount,
+              minMembers,
+              newlyJoinedList,
+              checkedTotal,
+              skippedSmall,
+              skippedClosed,
+              invalidCount,
+              `✅ Вошел в №${num} «${title}» (${size} уч.)\n⏳ КД 10 минут до следующего входа (осталось: ${timeStr})`
+            );
+          }
+          await delay(1000);
+        }
+      } else {
+        await updateLiveProgress(
+          chatId,
+          statusMsg.message_id,
+          targetCount,
+          minMembers,
+          newlyJoinedList,
+          checkedTotal,
+          skippedSmall,
+          skippedClosed,
+          invalidCount,
+          `✅ Вошел в №${num} «${title}» (${size} уч.)`
+        );
       }
     } catch (err) {
       const msg = String(err?.message || err || '');
@@ -960,22 +984,8 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
       }
       invalidCount++;
       saveAutoJoinDb();
-
-      if (checkedTotal % 5 === 0) {
-        await updateLiveProgress(
-          chatId,
-          statusMsg.message_id,
-          targetCount,
-          minMembers,
-          newlyJoinedList,
-          checkedTotal,
-          skippedSmall,
-          skippedClosed,
-          invalidCount,
-          `❌ Нерабочая ссылка №${num}`
-        );
-      }
-      await delay(2500);
+      triggerFastUiUpdate(`Нерабочая ссылка №${num}`);
+      await delay(SCAN_DELAY_MS);
     }
   }
 
@@ -996,8 +1006,8 @@ async function runAutoJoiner(chatId, targetCount = 10, minMembers = 100) {
     }
   }
 
-  report += `\n📊 Статистика отсева (НЕ считались в лимит):\n`;
-  report += `• Проверено всего ссылок за сеанс: ${checkedTotal}\n`;
+  report += `\n📊 Быстрый отсев (НЕ считались в лимит):\n`;
+  report += `• Проверено ссылок за сеанс: ${checkedTotal}\n`;
   report += `• 🔒 Пропущено закрытых / по заявкам: ${skippedClosed}\n`;
   report += `• ⏭ Пропущено мелких (<${minMembers} уч.): ${skippedSmall}\n`;
   report += `• ❌ Нерабочих ссылок: ${invalidCount}\n`;
@@ -1028,15 +1038,15 @@ async function updateLiveProgress(
       : 'пока ищу подходящие...';
 
   const text =
-    `🟢 Авто-вход работает (только открытые чаты)...\n` +
+    `⚡ Авто-вход работает (быстрый перебор + КД 10 мин)\n` +
     `🎯 Цель: ${targetCount} открытых групп (${minMembers}+ уч.)\n\n` +
     `✅ РЕАЛЬНО ВОШЕЛ: ${newlyJoinedList.length} из ${targetCount}\n` +
     `🔢 Номера вошедших ссылок: ${joinedNumsStr}\n\n` +
-    `🔎 Проверено ссылок: ${checkedTotal} (пропуски НЕ идут в счёт!)\n` +
-    `🔒 Закрытых/по заявке пропущено: ${skippedClosed}\n` +
+    `🔎 Быстро проверено: ${checkedTotal} ссылок\n` +
+    `🔒 Закрытых пропущено: ${skippedClosed}\n` +
     `⏭ Мелких (<${minMembers} уч.) пропущено: ${skippedSmall}\n` +
     `❌ Нерабочих ссылок: ${invalidCount}\n\n` +
-    `📌 Последнее действие: ${lastAction}`;
+    `📌 Статус: ${lastAction}`;
 
   return bot.editMessageText(text, {
     chat_id: chatId,
@@ -1047,7 +1057,7 @@ async function updateLiveProgress(
   }).catch(() => {});
 }
 
-// ==================== ФУНКЦИЯ РАССЫЛКИ (КД 15 СЕКУНД) ====================
+// ==================== ФУНКЦИЯ РАССЫЛКИ ====================
 async function broadcastMessage(chatId, targetGroups) {
   if (!state.sock || !state.isConnected) {
     return bot.sendMessage(chatId, '❌ WhatsApp не подключен. Сначала нажми «Войти в аккаунт».');
@@ -1072,7 +1082,7 @@ async function broadcastMessage(chatId, targetGroups) {
   try {
     statusMsg = await bot.sendMessage(
       chatId,
-      `⏳ Начинаю рассылку по ${targetGroups.length} группам (КД 15 сек)...`
+      `⏳ Начинаю рассылку по ${targetGroups.length} группам (КД: ${formatDelayLabel(state.broadcastDelayMs)})...`
     );
 
     let mediaBuffer = null;
@@ -1101,7 +1111,7 @@ async function broadcastMessage(chatId, targetGroups) {
       }
 
       if (i < targetGroups.length - 1) {
-        await delay(15000 + Math.floor(Math.random() * 1000));
+        await delay(state.broadcastDelayMs + Math.floor(Math.random() * 1000));
       }
     }
 
@@ -1266,7 +1276,6 @@ bot.on('message', async (msg) => {
     );
   }
 
-  // Ввод параметров авто-входа (например: "10 100")
   if (state.step === 'AWAITING_AUTOJOIN_PARAMS' && text) {
     const nums = text.match(/\d+/g);
     if (nums && nums.length >= 2) {
@@ -1355,6 +1364,17 @@ bot.on('callback_query', async (query) => {
   const data = query.data || '';
 
   if (data === 'noop') return bot.answerCallbackQuery(query.id);
+
+  // Переключение КД рассылки (15 сек -> 1 мин -> 5 мин -> 10 мин)
+  if (data === 'b_toggle_cd') {
+    const options = [15000, 60000, 300000, 600000];
+    const currentIdx = options.indexOf(state.broadcastDelayMs);
+    state.broadcastDelayMs = options[(currentIdx + 1) % options.length];
+    await bot.answerCallbackQuery(query.id, {
+      text: `КД рассылки изменен на ${formatDelayLabel(state.broadcastDelayMs)}`
+    });
+    return sendDraftPreview(chatId, messageId);
+  }
 
   // Кнопки панели Авто-входа
   if (data === 'aj_menu') {
