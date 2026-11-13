@@ -34,9 +34,6 @@ const MAX_USERS = 25;
 const PAGE_SIZE = 10;
 const ADMIN_PAGE_SIZE = 6;
 const BROADCAST_DELAY_MS = 18000;
-const COLLECTOR_CHECK_DELAY_MS = 2500;
-const COLLECTOR_TARGET_LIMIT = 1000;
-const COLLECTOR_MAX_DURATION_MS = 24 * 60 * 60 * 1000; // 24 часа
 const TG_FILE_LIMIT = 20 * 1024 * 1024;
 
 const logger = pino({ level: 'silent' });
@@ -44,10 +41,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isOwner = (id) => Number(id) === OWNER_ID;
 const isSubAdmin = (id) => SUB_ADMINS.has(Number(id));
 const isAdmin = (id) => isOwner(id) || (isSubAdmin(id) && !bannedUsers.has(Number(id)));
-
-const INVITE_REGEX = /(?:https?:\/\/)?chat\.whatsapp\.com\/(?:invite\/)?([A-Za-z0-9]{20,26})/gi;
-const TOPIC_REGEX = /(купи|купл|продай|продаж|комиссион|комисион|барахол|объявлен|обьявлен|авито|avito|реклам|ссыл|рынок|доска|рассылк|бесплатн|товар|одежд|опт|розниц|услуг|взаимн|пиар)/i;
-const BLACKLIST_REGEX = /(получении прав|водительск|svgroup|казино|ставк|крипт|арбитраж|интим|18\+)/i;
 
 process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
 process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
@@ -83,7 +76,6 @@ function downloadBuffer(url, redirects = 3) {
 const sessions = new Map();
 const bannedUsers = new Set();
 const usersMeta = new Map();
-const globalCollectors = new Map(); // chatId -> collector state
 
 const BANNED_FILE = path.join(__dirname, 'banned.json');
 const META_FILE = path.join(__dirname, 'users_meta.json');
@@ -115,8 +107,6 @@ const saveUsersMeta = () => writeJson(META_FILE, Object.fromEntries(usersMeta));
 
 const getUserExclPath = (id) => path.join(__dirname, `excluded_${id}.json`);
 const getUserAuthDir = (id) => path.join(__dirname, `auth_info_${id}`);
-const getCollectorPath = (id) => path.join(__dirname, `collector_state_${id}.json`);
-const getExportPath = (id) => path.join(__dirname, `open_trade_groups_${id}.txt`);
 
 function loadExcluded(id, s) {
   const arr = readJson(getUserExclPath(id), []);
@@ -126,327 +116,6 @@ const saveExcluded = (id, s) => writeJson(getUserExclPath(id), [...s.excludedGro
 
 const shortId = (gid) => String(gid).replace(/@g\.us$/, '');
 const findGroupByShort = (s, sid) => s.groupsCache.find((g) => shortId(g.id) === sid);
-
-function getUserCollector(chatId) {
-  const id = Number(chatId);
-  if (!globalCollectors.has(id)) {
-    const c = {
-      isCollecting: false,
-      startTime: 0,
-      processingQueue: false,
-      statusMsgId: null,
-      lastUiUpdate: 0,
-      stats: { skippedMine: 0, skippedClosed: 0, skippedOffTopic: 0, skippedDead: 0 },
-      myGroupJids: new Set(),
-      checkedCodes: new Set(),
-      pendingQueue: [],
-      collected: []
-    };
-    const raw = readJson(getCollectorPath(id), null);
-    if (raw) {
-      if (raw.isCollecting) {
-        c.isCollecting = true;
-        c.startTime = raw.startTime || Date.now();
-      }
-      if (Array.isArray(raw.checkedCodes)) raw.checkedCodes.forEach((code) => c.checkedCodes.add(String(code)));
-      if (Array.isArray(raw.collected)) c.collected = raw.collected;
-      if (raw.stats) c.stats = { ...c.stats, ...raw.stats };
-    }
-    globalCollectors.set(id, c);
-  }
-  return globalCollectors.get(id);
-}
-
-function saveUserCollector(chatId) {
-  const id = Number(chatId);
-  const c = globalCollectors.get(id);
-  if (!c) return;
-  writeJson(getCollectorPath(id), {
-    isCollecting: c.isCollecting,
-    startTime: c.startTime,
-    checkedCodes: [...c.checkedCodes],
-    collected: c.collected,
-    stats: c.stats
-  });
-}
-
-function extractTextFromWaMessage(msg) {
-  if (!msg?.message) return '';
-  const m = msg.message;
-  return (
-    m.conversation ||
-    m.extendedTextMessage?.text ||
-    m.imageMessage?.caption ||
-    m.videoMessage?.caption ||
-    m.documentMessage?.caption ||
-    m.buttonsResponseMessage?.selectedDisplayText ||
-    m.listResponseMessage?.title ||
-    m.templateButtonReplyMessage?.selectedDisplayText ||
-    ''
-  );
-}
-
-function isTargetTradeGroup(info) {
-  const onlyAdmins = Boolean(info.announce || info.isCommunityAnnounce);
-  const joinApproval = Boolean(info.joinApprovalMode || info.membershipApprovalMode);
-
-  if (onlyAdmins) {
-    return { ok: false, reason: 'closed' };
-  }
-
-  const subject = String(info.subject || '').trim();
-  const desc = String(info.desc || '').trim();
-  const haystack = `${subject} ${desc}`;
-
-  if (BLACKLIST_REGEX.test(haystack) || !TOPIC_REGEX.test(haystack)) {
-    return { ok: false, reason: 'offtopic' };
-  }
-
-  const status = joinApproval ? '🟡 ПО ЗАЯВКЕ' : '🟢 ОТКРЫТАЯ';
-  return { ok: true, status, onlyAdmins, joinApproval };
-}
-
-function getCollectorInlineKeyboard(c) {
-  if (c.isCollecting) {
-    return {
-      inline_keyboard: [
-        [{ text: '🛑 Остановиться и получить список', callback_data: 'col_stop_send' }],
-        [{ text: '🔄 Обновить статус', callback_data: 'col_refresh' }]
-      ]
-    };
-  }
-  return {
-    inline_keyboard: [
-      [{ text: '▶️ Начать сканирование ссылок (24ч)', callback_data: 'col_start' }],
-      [{ text: '📥 Скачать текущий .txt файл', callback_data: 'col_download' }],
-      [{ text: '🧹 Очистить базу', callback_data: 'col_clear' }]
-    ]
-  };
-}
-
-function buildCollectorStatusText(chatId) {
-  const s = sessions.get(Number(chatId));
-  const c = getUserCollector(chatId);
-  const waOk = Boolean(s?.isConnected);
-
-  let timeLeftStr = '24 часа';
-  if (c.isCollecting && c.startTime > 0) {
-    const elapsed = Date.now() - c.startTime;
-    const left = Math.max(0, COLLECTOR_MAX_DURATION_MS - elapsed);
-    const hours = Math.floor(left / (1000 * 60 * 60));
-    const mins = Math.floor((left % (1000 * 60 * 60)) / (1000 * 60));
-    timeLeftStr = `${hours}ч ${mins}мин`;
-  }
-
-  const modeStr = c.isCollecting
-    ? `🟢 Сканирование активно (Осталось: ${timeLeftStr})`
-    : '⏸ ОСТАНОВЛЕН / ЗАВЕРШЕН';
-
-  return (
-    `🔍 <b>Сканер ссылок и групп (24 часа)</b>\n` +
-    `<i>Тематика: купи-продай, авито, комиссионки, ссылки</i>\n\n` +
-    `Статус WhatsApp: ${waOk ? '🟢 Подключен' : '🔴 Не подключен'}\n` +
-    `Статус: <b>${modeStr}</b>\n` +
-    `В очереди на проверку: <b>${c.pendingQueue.length}</b>\n\n` +
-    `🚫 Авто-фильтр отсеял:\n` +
-    `• Своих чатов: ${c.myGroupJids.size} (пропущено: ${c.stats.skippedMine})\n` +
-    `• Закрытых стен: ${c.stats.skippedClosed}\n` +
-    `• Не по теме: ${c.stats.skippedOffTopic}\n` +
-    `• Битых ссылок: ${c.stats.skippedDead}\n\n` +
-    `📦 <b>Собрано ${c.collected.length} групп из ${COLLECTOR_TARGET_LIMIT}</b>`
-  );
-}
-
-async function updateCollectorUi(chatId, force = false) {
-  const id = Number(chatId);
-  const c = getUserCollector(id);
-  const now = Date.now();
-  if (!force && now - c.lastUiUpdate < 3500) return;
-  c.lastUiUpdate = now;
-
-  const text = buildCollectorStatusText(id);
-  const reply_markup = getCollectorInlineKeyboard(c);
-
-  if (c.statusMsgId) {
-    try {
-      await bot.editMessageText(text, {
-        chat_id: id,
-        message_id: c.statusMsgId,
-        parse_mode: 'HTML',
-        reply_markup
-      });
-      return;
-    } catch (e) {
-      if (String(e?.message || '').includes('message is not modified')) return;
-    }
-  }
-
-  const sent = await bot.sendMessage(id, text, {
-    parse_mode: 'HTML',
-    reply_markup
-  }).catch(() => null);
-
-  if (sent) c.statusMsgId = sent.message_id;
-}
-
-function buildCollectorTxtContent(chatId) {
-  const c = getUserCollector(chatId);
-  const sorted = [...c.collected].sort((a, b) => (b.size || 0) - (a.size || 0));
-  const lines = [
-    `📊 ОТЧЕТ ПО ГРУППАМ WHATSAPP (КУПИ-ПРОДАЙ / КОМИССИОНКИ / АВИТО / ССЫЛКИ)`,
-    `Всего собрано: ${sorted.length} из ${COLLECTOR_TARGET_LIMIT}`,
-    `Дата формирования: ${new Date().toLocaleString('ru-RU')}`,
-    `==================================================`,
-    ``
-  ];
-
-  for (let i = 0; i < sorted.length; i++) {
-    const g = sorted[i];
-    lines.push(`${i + 1}. Название: ${g.subject}`);
-    lines.push(`Участников: ${g.size}`);
-    lines.push(`Статус: ${g.status}`);
-    lines.push(`Ссылка: ${g.link}`);
-    lines.push(`--------------------------------------------------`);
-  }
-
-  return lines.join('\n');
-}
-
-async function sendCollectorTxtFile(chatId, captionPrefix) {
-  const id = Number(chatId);
-  const c = getUserCollector(id);
-  if (!c.collected.length) {
-    return bot.sendMessage(id, '📭 Список пока пуст — ещё не найдено ни одной подходящей группы.').catch(() => {});
-  }
-
-  const exportPath = getExportPath(id);
-  const txt = buildCollectorTxtContent(id);
-  fs.writeFileSync(exportPath, txt, 'utf-8');
-
-  await bot.sendDocument(id, exportPath, {
-    caption: `${captionPrefix}\n✅ Всего групп в файле: ${c.collected.length} шт.`
-  }).catch((e) => console.error('sendCollectorTxtFile error:', e.message));
-
-  try { fs.unlinkSync(exportPath); } catch (_) {}
-}
-
-function enqueueInviteCodesForUser(chatId, text) {
-  const c = getUserCollector(chatId);
-  if (!text || !c.isCollecting) return;
-
-  if (c.startTime > 0 && Date.now() - c.startTime >= COLLECTOR_MAX_DURATION_MS) {
-    c.isCollecting = false;
-    saveUserCollector(chatId);
-    updateCollectorUi(chatId, true);
-    sendCollectorTxtFile(chatId, `⏰ Время сканирования (24 часа) истекло! Собрано ${c.collected.length} групп.`);
-    return;
-  }
-
-  INVITE_REGEX.lastIndex = 0;
-  let match;
-  let added = false;
-
-  while ((match = INVITE_REGEX.exec(text)) !== null) {
-    const code = match[1].trim();
-    if (code.length >= 20 && !c.checkedCodes.has(code) && !c.pendingQueue.includes(code)) {
-      c.pendingQueue.push(code);
-      added = true;
-    }
-  }
-
-  if (added) {
-    processUserCollectorQueue(chatId);
-  }
-}
-
-async function processUserCollectorQueue(chatId) {
-  const id = Number(chatId);
-  const c = getUserCollector(id);
-  if (c.processingQueue) return;
-  c.processingQueue = true;
-
-  try {
-    while (c.pendingQueue.length > 0 && c.isCollecting) {
-      if (c.startTime > 0 && Date.now() - c.startTime >= COLLECTOR_MAX_DURATION_MS) {
-        c.isCollecting = false;
-        saveUserCollector(id);
-        await updateCollectorUi(id, true);
-        await sendCollectorTxtFile(id, `⏰ Время сканирования (24 часа) истекло! Собрано ${c.collected.length} групп.`);
-        break;
-      }
-
-      const s = sessions.get(id);
-      if (!s || !s.isConnected || !s.sock) break;
-
-      const code = c.pendingQueue.shift();
-      if (!code || c.checkedCodes.has(code)) continue;
-
-      c.checkedCodes.add(code);
-
-      try {
-        const info = await s.sock.groupGetInviteInfo(code);
-        if (info && info.id) {
-          const gid = String(info.id);
-
-          if (c.myGroupJids.has(gid)) {
-            c.stats.skippedMine++;
-            saveUserCollector(id);
-            await updateCollectorUi(id, false);
-            await sleep(COLLECTOR_CHECK_DELAY_MS);
-            continue;
-          }
-
-          if (c.collected.some((item) => item.id === gid)) {
-            saveUserCollector(id);
-            await sleep(COLLECTOR_CHECK_DELAY_MS);
-            continue;
-          }
-
-          const check = isTargetTradeGroup(info);
-          if (!check.ok) {
-            if (check.reason === 'closed') c.stats.skippedClosed++;
-            else c.stats.skippedOffTopic++;
-            saveUserCollector(id);
-            await updateCollectorUi(id, false);
-            await sleep(COLLECTOR_CHECK_DELAY_MS);
-            continue;
-          }
-
-          const subject = String(info.subject || 'Без названия').replace(/[\r\n\t]+/g, ' ').trim();
-          const size = Number(info.size || info.participants?.length || 0);
-
-          c.collected.push({
-            code,
-            id: gid,
-            subject,
-            size,
-            status: check.status,
-            link: `https://chat.whatsapp.com/${code}`
-          });
-
-          saveUserCollector(id);
-          await updateCollectorUi(id, false);
-
-          if (c.collected.length >= COLLECTOR_TARGET_LIMIT) {
-            c.isCollecting = false;
-            saveUserCollector(id);
-            await updateCollectorUi(id, true);
-            await sendCollectorTxtFile(id, `🎯 Задание выполнено! Собрано ровно ${c.collected.length} групп (лимит 1000 достигнут).`);
-            break;
-          }
-        }
-      } catch (_) {
-        c.stats.skippedDead++;
-        saveUserCollector(id);
-        await updateCollectorUi(id, false);
-      }
-
-      await sleep(COLLECTOR_CHECK_DELAY_MS);
-    }
-  } finally {
-    c.processingQueue = false;
-  }
-}
 
 // ==================== СЕССИИ ПОЛЬЗОВАТЕЛЕЙ ====================
 function getUserSession(chatId) {
@@ -539,18 +208,17 @@ process.on('SIGINT', () => { bot.stopPolling().catch(() => {}); server.close(() 
 const MENU_BUTTONS = new Set([
   'Войти в аккаунт', 'Список групп', 'Обновить список групп',
   'Список исключение', 'Список исключений', '📦 Выгрузить мои группы',
-  '🔍 Сканировать ссылки (24ч)', 'Выйти из ватсап', '👑 Админ-панель'
+  'Выйти из ватсап', '👑 Админ-панель'
 ]);
 
 function getMainMenuKeyboard(chatId) {
   const kb = [
     [{ text: 'Войти в аккаунт' }, { text: 'Список групп' }],
-    [{ text: '🔍 Сканировать ссылки (24ч)' }, { text: '📦 Выгрузить мои группы' }],
     [{ text: 'Обновить список групп' }, { text: 'Список исключение' }],
-    [{ text: 'Выйти из ватсап' }]
+    [{ text: '📦 Выгрузить мои группы' }, { text: 'Выйти из ватсап' }]
   ];
   if (isAdmin(chatId)) {
-    kb[3].push({ text: '👑 Админ-панель' });
+    kb.push([{ text: '👑 Админ-панель' }]);
   }
   return { reply_markup: { keyboard: kb, resize_keyboard: true } };
 }
@@ -604,9 +272,7 @@ function buildAdminView(viewerId, page = 0) {
     if (banned) {
       act.push({ text: '✅ Разбан', callback_data: `adm_unban:${id}:${cur}` });
     } else {
-      if (conn) act.push({ text: '🔌 Кик WA', callback_data: `adm_kick:${id}:${cur}` });
-      if (s?.isBroadcasting) act.push({ text: '🛑 Стоп рассылки', callback_data: `adm_stopbc:${id}:${cur}` });
-      act.push({ text: '🔨 Бан', callback_data: `adm_ban:${id}:${cur}` }, { text: '🔄 Сброс', callback_data: `adm_reset:${id}:${cur}` });
+      act.push({ text: '🔨 Бан', callback_data: `adm_ban:${id}:${cur}` });
     }
     act.push({ text: '🗑 Удалить', callback_data: `adm_del:${id}:${cur}` });
     rows.push(act);
@@ -619,7 +285,7 @@ function buildAdminView(viewerId, page = 0) {
     if (cur < pages - 1) nav.push({ text: '➡️', callback_data: `adm_pg:${cur + 1}` });
     rows.push(nav);
   }
-  rows.push([{ text: '📢 Написать всем', callback_data: 'adm_msg_all' }, { text: '🔄 Обновить', callback_data: `adm_pg:${cur}` }]);
+  rows.push([{ text: '🔄 Обновить', callback_data: `adm_pg:${cur}` }]);
   return { text: t.slice(0, 4000), reply_markup: { inline_keyboard: rows } };
 }
 
@@ -632,11 +298,9 @@ function buildSingleGroupKeyboard(s, page = 0) {
   ]);
   const nav = [];
   if (cur > 0) nav.push({ text: '⏮ 1', callback_data: 'b_one_page:0' });
-  if (cur > 0) nav.push({ text: '⏪ -5', callback_data: `b_one_page:${Math.max(0, cur - 5)}` });
   if (cur > 0) nav.push({ text: '⬅️', callback_data: `b_one_page:${cur - 1}` });
   nav.push({ text: `${cur + 1}/${pages}`, callback_data: 'noop' });
   if (cur < pages - 1) nav.push({ text: '➡️', callback_data: `b_one_page:${cur + 1}` });
-  if (cur < pages - 1) nav.push({ text: '+5 ⏩', callback_data: `b_one_page:${Math.min(pages - 1, cur + 5)}` });
   if (cur < pages - 1) nav.push({ text: `⏭ ${pages}`, callback_data: `b_one_page:${pages - 1}` });
   rows.push(nav, [{ text: '🔙 Назад', callback_data: 'b_back' }]);
   return { inline_keyboard: rows };
@@ -670,11 +334,9 @@ async function renderExclusionsMenu(chatId, s, patch = {}) {
   if (pages > 1) {
     const nav = [];
     if (cur > 0) nav.push({ text: '⏮ 1', callback_data: 'excl_pg:0' });
-    if (cur > 0) nav.push({ text: '⏪ -5', callback_data: `excl_pg:${Math.max(0, cur - 5)}` });
     if (cur > 0) nav.push({ text: '⬅️', callback_data: `excl_pg:${cur - 1}` });
     nav.push({ text: `${cur + 1}/${pages}`, callback_data: 'noop' });
     if (cur < pages - 1) nav.push({ text: '➡️', callback_data: `excl_pg:${cur + 1}` });
-    if (cur < pages - 1) nav.push({ text: '+5 ⏩', callback_data: `excl_pg:${Math.min(pages - 1, cur + 5)}` });
     if (cur < pages - 1) nav.push({ text: `⏭ ${pages}`, callback_data: `excl_pg:${pages - 1}` });
     rows.push(nav);
   }
@@ -727,7 +389,7 @@ function clearUserAuthFolder(id) {
 
 const normJid = (j) => String(j || '').split(':')[0].split('@')[0];
 
-async function refreshGroupsCache(s, chatId = null) {
+async function refreshGroupsCache(s) {
   if (!s.sock || !s.isConnected) throw new Error('WA не подключен');
   const p = await s.sock.groupFetchAllParticipating();
   const u = s.sock.user || {};
@@ -735,11 +397,6 @@ async function refreshGroupsCache(s, chatId = null) {
 
   const rawGroups = Object.values(p);
   const resolved = [];
-
-  if (chatId) {
-    const c = getUserCollector(chatId);
-    c.myGroupJids = new Set(rawGroups.map((g) => String(g.id)));
-  }
 
   for (const g of rawGroups) {
     const jid = String(g.id);
@@ -780,7 +437,7 @@ async function refreshGroupsCache(s, chatId = null) {
 async function ensureGroupsLoaded(id, s) {
   if (!s.excludedGroups.size) loadExcluded(id, s);
   if (!s.groupsCache.length && s.isConnected) {
-    try { await refreshGroupsCache(s, id); } catch (e) { console.error('ensureGroupsLoaded', e.message); }
+    try { await refreshGroupsCache(s); } catch (e) { console.error('ensureGroupsLoaded', e.message); }
   }
 }
 
@@ -792,7 +449,7 @@ async function exportUserGroupsReport(chatId, s) {
   const waitMsg = await bot.sendMessage(chatId, '⏳ Собираю актуальный список ваших групп, названия, статусы и доступные инвайт-ссылки...').catch(() => null);
 
   try {
-    await refreshGroupsCache(s, chatId);
+    await refreshGroupsCache(s);
     if (!s.groupsCache.length) {
       if (waitMsg) await bot.editMessageText('📭 У вас нет активных групп.', { chat_id: chatId, message_id: waitMsg.message_id }).catch(() => {});
       return;
@@ -928,40 +585,13 @@ async function startWhatsAppSession(chatId, opts = {}) {
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
       markOnlineOnConnect: false,
-      syncFullHistory: true,
+      syncFullHistory: false,
       generateHighQualityLinkPreview: false,
       getMessage: async () => undefined
     });
 
     s.sock = sock;
     sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('messaging-history.set', ({ messages }) => {
-      const c = getUserCollector(id);
-      if (!c.isCollecting || !Array.isArray(messages)) return;
-      for (const m of messages) {
-        const txt = extractTextFromWaMessage(m);
-        if (txt) enqueueInviteCodesForUser(id, txt);
-      }
-    });
-
-    sock.ev.on('messages.upsert', ({ messages }) => {
-      const c = getUserCollector(id);
-      if (!c.isCollecting || !Array.isArray(messages)) return;
-      for (const m of messages) {
-        const txt = extractTextFromWaMessage(m);
-        if (txt) enqueueInviteCodesForUser(id, txt);
-      }
-    });
-
-    sock.ev.on('groups.upsert', (newGroups) => {
-      const c = getUserCollector(id);
-      if (Array.isArray(newGroups)) {
-        for (const g of newGroups) {
-          if (g?.id) c.myGroupJids.add(String(g.id));
-        }
-      }
-    });
 
     sock.ev.on('connection.update', async (upd) => {
       if (s.isStopped || s.sock !== sock) return;
@@ -1001,16 +631,9 @@ async function startWhatsAppSession(chatId, opts = {}) {
         s.qrCount = 0;
         loadExcluded(id, s);
 
-        try { await refreshGroupsCache(s, id); } catch (_) {}
+        try { await refreshGroupsCache(s); } catch (_) {}
 
         await bot.sendMessage(id, `✅ WhatsApp подключен! Групп: ${s.groupsCache.length}`, getMainMenuKeyboard(id)).catch(() => {});
-
-        const c = getUserCollector(id);
-        if (c.isCollecting) {
-          c.statusMsgId = null;
-          await updateCollectorUi(id, true);
-          if (c.pendingQueue.length > 0) processUserCollectorQueue(id);
-        }
       }
 
       if (connection === 'close') {
@@ -1136,7 +759,7 @@ async function broadcastMessage(chatId, s, target) {
   let statusMsg = null;
 
   try {
-    try { await refreshGroupsCache(s, chatId); } catch (_) {}
+    try { await refreshGroupsCache(s); } catch (_) {}
     let pool = s.groupsCache;
     if (target.mode === 'one') pool = pool.filter((g) => shortId(g.id) === target.sid);
     else pool = pool.filter((g) => !s.excludedGroups.has(String(g.id)));
@@ -1252,14 +875,14 @@ bot.onText(/^\/start/, async (msg) => {
     bot.sendMessage(OWNER_ID, `🔔 Новый участник вошел в бота: ${s.name} ${s.username} [${id}]`).catch(() => {});
   }
 
-  let t = `👋 Панель управления WhatsApp\n\n` +
-          `Статус WA: ${s.isConnected ? '🟢 Подключен' : '🔴 Не подключен'}\n` +
-          `Групп: ${s.groupsCache.length} | Искл: ${s.excludedGroups.size}\n` +
-          `Слоты: ${Math.max(0, MAX_USERS - countConnectedClients())}/${MAX_USERS}\n\n` +
-          `🔍 Нажмите <b>«🔍 Сканировать ссылки (24ч)»</b>, чтобы запустить поиск открытых групп (купи-продай, авито, комиссионки, ссылочные).\n\n` +
-          `Или отправьте текст, фото или видео для рассылки:`;
+  const t =
+    `👋 Панель управления WhatsApp\n\n` +
+    `Статус WA: ${s.isConnected ? '🟢 Подключен' : '🔴 Не подключен'}\n` +
+    `Групп: ${s.groupsCache.length} | Искл: ${s.excludedGroups.size}\n` +
+    `Слоты: ${Math.max(0, MAX_USERS - countConnectedClients())}/${MAX_USERS}\n\n` +
+    `Отправьте текст, фото или видео (с подписью) для рассылки:`;
 
-  await bot.sendMessage(id, t, { parse_mode: 'HTML', ...getMainMenuKeyboard(id) }).catch(() => {});
+  await bot.sendMessage(id, t, getMainMenuKeyboard(id)).catch(() => {});
 });
 
 bot.on('message', async (msg) => {
@@ -1272,12 +895,6 @@ bot.on('message', async (msg) => {
 
     const s = getUserSession(id);
     if (MENU_BUTTONS.has(text)) s.step = 'IDLE';
-
-    if (text === '🔍 Сканировать ссылки (24ч)') {
-      const c = getUserCollector(id);
-      c.statusMsgId = null;
-      return updateCollectorUi(id, true);
-    }
 
     if (text === '👑 Админ-панель') {
       if (!isAdmin(id)) return;
@@ -1334,7 +951,7 @@ bot.on('message', async (msg) => {
       if (!s.isConnected) return bot.sendMessage(id, '🔴 WhatsApp не подключен.').catch(() => {});
       const w = await bot.sendMessage(id, '🔄 Обновляю и подтягиваю названия...').catch(() => null);
       try {
-        await refreshGroupsCache(s, id);
+        await refreshGroupsCache(s);
         if (w) await bot.editMessageText(`✅ Обновлено! Групп: ${s.groupsCache.length}`, { chat_id: id, message_id: w.message_id }).catch(() => {});
       } catch (e) {
         if (w) await bot.editMessageText(`❌ Ошибка: ${e.message}`, { chat_id: id, message_id: w.message_id }).catch(() => {});
@@ -1352,9 +969,6 @@ bot.on('message', async (msg) => {
     if (text === 'Выйти из ватсап') {
       s.stopBroadcast = true;
       s.wasEverConnected = false;
-      const c = getUserCollector(id);
-      c.isCollecting = false;
-      saveUserCollector(id);
       if (s.sock) { try { await s.sock.logout().catch(() => {}); } catch (_) {} }
       destroySocket(s);
       clearUserAuthFolder(id);
@@ -1368,20 +982,6 @@ bot.on('message', async (msg) => {
       return renderExclusionsMenu(id, s, { query: text, page: 0 });
     }
 
-    if (s.step === 'AWAITING_ADMIN_BROADCAST' && text) {
-      s.step = 'IDLE';
-      if (!isAdmin(id)) return;
-      if (text.toLowerCase() === 'отмена') return bot.sendMessage(id, '❌ Отменено.', getMainMenuKeyboard(id)).catch(() => {});
-      let sent = 0;
-      for (const uid of getVisibleUserIds(id)) {
-        if (!bannedUsers.has(uid)) {
-          try { await bot.sendMessage(uid, `📢 Сообщение от админа:\n\n${text}`); sent++; } catch (_) {}
-          await sleep(60);
-        }
-      }
-      return bot.sendMessage(id, `✅ Доставлено: ${sent}`, getMainMenuKeyboard(id)).catch(() => {});
-    }
-
     if (s.step === 'AWAITING_PHONE' && text) {
       let ph = text.replace(/\D/g, '');
       if (ph.length === 11 && ph.startsWith('8')) ph = '7' + ph.slice(1);
@@ -1389,16 +989,6 @@ bot.on('message', async (msg) => {
       s.step = 'IDLE';
       await bot.sendMessage(id, `⏳ Запрашиваю код для +${ph}...`).catch(() => {});
       return startWhatsAppSession(id, { reset: true, phoneNumber: ph, forceQr: false });
-    }
-
-    if (text && text.includes('chat.whatsapp.com')) {
-      const c = getUserCollector(id);
-      c.isCollecting = true;
-      if (!c.startTime) c.startTime = Date.now();
-      saveUserCollector(id);
-      enqueueInviteCodesForUser(id, text);
-      await bot.sendMessage(id, `📥 Ссылки добавлены в очередь (в очереди: ${c.pendingQueue.length}).`).catch(() => {});
-      return updateCollectorUi(id, true);
     }
 
     let draft = null;
@@ -1446,52 +1036,7 @@ bot.on('callback_query', async (q) => {
     if (bannedUsers.has(id) && !isOwner(id)) return ack({ text: 'Доступ закрыт.', show_alert: true });
 
     const s = getUserSession(id);
-    const c = getUserCollector(id);
     if (data === 'noop') return ack();
-
-    // Управление сканером для каждого участника
-    if (data.startsWith('col_')) {
-      if (data === 'col_stop_send') {
-        c.isCollecting = false;
-        saveUserCollector(id);
-        await ack({ text: '🛑 Сканирование остановлено, формирую файл...' });
-        await updateCollectorUi(id, true);
-        return sendCollectorTxtFile(id, `🛑 Сканирование остановлено. Найдено групп: ${c.collected.length}`);
-      }
-
-      if (data === 'col_start') {
-        if (!s.isConnected) return ack({ text: '❌ Сначала подключите свой WhatsApp!', show_alert: true });
-        await refreshGroupsCache(s, id).catch(() => {});
-        c.isCollecting = true;
-        if (!c.startTime) c.startTime = Date.now();
-        saveUserCollector(id);
-        await ack({ text: '▶️ Сканирование запущено на 24 часа!' });
-        await updateCollectorUi(id, true);
-        processUserCollectorQueue(id);
-        return;
-      }
-
-      if (data === 'col_refresh') {
-        await ack({ text: `Собрано: ${c.collected.length} из ${COLLECTOR_TARGET_LIMIT}` });
-        return updateCollectorUi(id, true);
-      }
-
-      if (data === 'col_download') {
-        await ack({ text: '📥 Выгружаю .txt файл...' });
-        return sendCollectorTxtFile(id, `📋 Текущая база (${c.collected.length} групп)`);
-      }
-
-      if (data === 'col_clear') {
-        c.collected = [];
-        c.pendingQueue = [];
-        c.checkedCodes.clear();
-        c.startTime = 0;
-        c.stats = { skippedMine: 0, skippedClosed: 0, skippedOffTopic: 0, skippedDead: 0 };
-        saveUserCollector(id);
-        await ack({ text: '🗑 База очищена!' });
-        return updateCollectorUi(id, true);
-      }
-    }
 
     if (data === 'export_confirm') {
       await ack({ text: 'Запускаю выгрузку...' });
@@ -1528,12 +1073,6 @@ bot.on('callback_query', async (q) => {
         await ack();
         return show(parseInt(data.split(':')[1], 10) || 0);
       }
-      if (data === 'adm_msg_all') {
-        s.step = 'AWAITING_ADMIN_BROADCAST';
-        await ack();
-        return bot.sendMessage(id, '📢 Введите сообщение для всех клиентов (или напишите Отмена):').catch(() => {});
-      }
-
       const [act, tidStr, pageStr] = data.split(':');
       const tid = Number(tidStr);
       const page = parseInt(pageStr, 10) || 0;
@@ -1542,20 +1081,11 @@ bot.on('callback_query', async (q) => {
       }
       const ts = sessions.get(tid);
 
-      if (act === 'adm_stopbc') {
-        if (ts && ts.isBroadcasting) {
-          ts.stopBroadcast = true;
-          bot.sendMessage(tid, '🛑 Администратор остановил вашу рассылку.').catch(() => {});
-        }
-        await ack({ text: 'Рассылка остановлена' });
-        return show(page);
-      }
-
-      if (act === 'adm_kick' || act === 'adm_ban' || act === 'adm_reset' || act === 'adm_del') {
+      if (act === 'adm_ban' || act === 'adm_del') {
         if (ts) {
           ts.stopBroadcast = true;
           ts.wasEverConnected = false;
-          if (ts.sock && act !== 'adm_reset') { try { await ts.sock.logout().catch(() => {}); } catch (_) {} }
+          if (ts.sock) { try { await ts.sock.logout().catch(() => {}); } catch (_) {} }
           destroySocket(ts);
           ts.groupsCache = [];
         }
