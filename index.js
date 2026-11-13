@@ -1,3 +1,4 @@
+// file: index.js
 'use strict';
 
 const express = require('express');
@@ -11,12 +12,19 @@ const https = require('https');
 const http = require('http');
 
 const makeWASocket = baileys.default?.default || baileys.default || baileys;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, Browsers } = baileys;
+const {
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  Browsers
+} = baileys;
 
+// ==================== КОНФИГУРАЦИЯ ====================
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) {
-  console.error('Не задана переменная окружения TELEGRAM_TOKEN. Задай токен бота и перезапусти.');
+  console.error('Ошибка: не задана переменная окружения TELEGRAM_TOKEN.');
   process.exit(1);
 }
 
@@ -26,7 +34,8 @@ const MAX_USERS = 25;
 const PAGE_SIZE = 10;
 const ADMIN_PAGE_SIZE = 6;
 const BROADCAST_DELAY_MS = 18000;
-const SCAN_DELAY_MS = 200;
+const COLLECTOR_CHECK_DELAY_MS = 2500;
+const COLLECTOR_TARGET_LIMIT = 1000;
 const TG_FILE_LIMIT = 20 * 1024 * 1024;
 
 const logger = pino({ level: 'silent' });
@@ -35,14 +44,9 @@ const isOwner = (id) => Number(id) === OWNER_ID;
 const isSubAdmin = (id) => SUB_ADMINS.has(Number(id));
 const isAdmin = (id) => isOwner(id) || (isSubAdmin(id) && !bannedUsers.has(Number(id)));
 
-const CODES_FILE = path.join(__dirname, 'invite_codes.txt');
-let RAW_INVITE_CODES = '';
-try {
-  RAW_INVITE_CODES = fs.readFileSync(CODES_FILE, 'utf-8');
-} catch (_) {
-  console.warn('invite_codes.txt не найден: поиск групп будет пустым.');
-}
-const EMBEDDED_LINKS = RAW_INVITE_CODES.trim().split(/\s+/).filter(Boolean).map((code, idx) => ({ num: idx + 1, code: code.trim() }));
+const INVITE_REGEX = /(?:https?:\/\/)?chat\.whatsapp\.com\/(?:invite\/)?([A-Za-z0-9]{20,26})/gi;
+const TOPIC_REGEX = /(купи|купл|продай|продаж|комиссион|комисион|барахол|объявлен|обьявлен|авито|avito|реклам|ссыл|рынок|доска|рассылк|бесплатн|товар|одежд|опт|розниц|услуг|взаимн|пиар)/i;
+const BLACKLIST_REGEX = /(получении прав|водительск|svgroup|казино|ставк|крипт|арбитраж|интим|18\+)/i;
 
 process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
 process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
@@ -74,14 +78,15 @@ function downloadBuffer(url, redirects = 3) {
   });
 }
 
+// ==================== ХРАНИЛИЩЕ И ФАЙЛЫ СОСТОЯНИЯ ====================
 const sessions = new Map();
 const bannedUsers = new Set();
 const usersMeta = new Map();
-const knownGroups = new Map();
 
 const BANNED_FILE = path.join(__dirname, 'banned.json');
 const META_FILE = path.join(__dirname, 'users_meta.json');
-const KNOWN_FILE = path.join(__dirname, `finder_db_${OWNER_ID}.json`);
+const COLLECTOR_FILE = path.join(__dirname, `vip_collector_${OWNER_ID}.json`);
+const COLLECTOR_EXPORT_FILE = path.join(__dirname, `open_trade_groups_${OWNER_ID}.txt`);
 
 function readJson(f, def) {
   try {
@@ -104,11 +109,9 @@ function writeJson(f, d) {
 
 readJson(BANNED_FILE, []).forEach((id) => bannedUsers.add(Number(id)));
 Object.entries(readJson(META_FILE, {})).forEach(([k, v]) => usersMeta.set(Number(k), v));
-Object.entries(readJson(KNOWN_FILE, {})).forEach(([k, v]) => knownGroups.set(Number(k), v));
 
 const saveBanned = () => writeJson(BANNED_FILE, [...bannedUsers]);
 const saveUsersMeta = () => writeJson(META_FILE, Object.fromEntries(usersMeta));
-const saveKnown = () => writeJson(KNOWN_FILE, Object.fromEntries(knownGroups));
 
 const getUserExclPath = (id) => path.join(__dirname, `excluded_${id}.json`);
 const getUserAuthDir = (id) => path.join(__dirname, `auth_info_${id}`);
@@ -122,6 +125,289 @@ const saveExcluded = (id, s) => writeJson(getUserExclPath(id), [...s.excludedGro
 const shortId = (gid) => String(gid).replace(/@g\.us$/, '');
 const findGroupByShort = (s, sid) => s.groupsCache.find((g) => shortId(g.id) === sid);
 
+// ==================== VIP-СБОРЩИК ОТКРЫТЫХ ГРУПП (ДЛЯ OWNER_ID) ====================
+const collector = {
+  isCollecting: false,
+  processingQueue: false,
+  statusMsgId: null,
+  lastUiUpdate: 0,
+  stats: {
+    skippedMine: 0,
+    skippedClosed: 0,
+    skippedOffTopic: 0,
+    skippedDead: 0
+  },
+  myGroupJids: new Set(),
+  checkedCodes: new Set(),
+  pendingQueue: [],
+  collected: []
+};
+
+function loadCollectorState() {
+  const raw = readJson(COLLECTOR_FILE, null);
+  if (!raw) return;
+  if (Array.isArray(raw.checkedCodes)) raw.checkedCodes.forEach((c) => collector.checkedCodes.add(String(c)));
+  if (Array.isArray(raw.collected)) collector.collected = raw.collected;
+  if (raw.stats) collector.stats = { ...collector.stats, ...raw.stats };
+}
+
+function saveCollectorState() {
+  writeJson(COLLECTOR_FILE, {
+    checkedCodes: [...collector.checkedCodes],
+    collected: collector.collected,
+    stats: collector.stats
+  });
+}
+
+loadCollectorState();
+
+function extractTextFromWaMessage(msg) {
+  if (!msg?.message) return '';
+  const m = msg.message;
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    m.templateButtonReplyMessage?.selectedDisplayText ||
+    ''
+  );
+}
+
+function isTargetTradeGroup(info) {
+  const onlyAdmins = Boolean(info.announce || info.isCommunityAnnounce);
+  const joinApproval = Boolean(info.joinApprovalMode || info.membershipApprovalMode);
+
+  if (onlyAdmins || joinApproval) {
+    return { ok: false, reason: 'closed' };
+  }
+
+  const subject = String(info.subject || '').trim();
+  const desc = String(info.desc || '').trim();
+  const haystack = `${subject} ${desc}`;
+
+  if (BLACKLIST_REGEX.test(haystack) || !TOPIC_REGEX.test(haystack)) {
+    return { ok: false, reason: 'offtopic' };
+  }
+
+  return { ok: true };
+}
+
+function getCollectorInlineKeyboard() {
+  if (collector.isCollecting) {
+    return {
+      inline_keyboard: [
+        [{ text: '🛑 Остановиться и получить список', callback_data: 'vip_stop_send' }],
+        [{ text: '🔄 Обновить счётчик', callback_data: 'vip_refresh' }]
+      ]
+    };
+  }
+  return {
+    inline_keyboard: [
+      [{ text: '▶️ Запустить / продолжить сбор', callback_data: 'vip_start' }],
+      [{ text: '📥 Скачать текущий .txt файл', callback_data: 'vip_download' }],
+      [{ text: '🧹 Очистить базу сбора', callback_data: 'vip_clear' }]
+    ]
+  };
+}
+
+function buildCollectorStatusText() {
+  const ownerSession = sessions.get(OWNER_ID);
+  const waOk = Boolean(ownerSession?.isConnected);
+  const modeStr = collector.isCollecting
+    ? '🟢 РАБОТАЕТ (мониторинг чатов 24/7)'
+    : '⏸ ОСТАНОВЛЕН';
+
+  return (
+    `💎 <b>VIP-сборщик открытых групп</b>\n` +
+    `<i>Тематика: купи-продай, комиссионки, объявления, барахолки, ссылки</i>\n\n` +
+    `WhatsApp Создателя: ${waOk ? '🟢 Подключен' : '🔴 Не подключен'}\n` +
+    `Режим: <b>${modeStr}</b>\n` +
+    `В очереди на проверку: <b>${collector.pendingQueue.length}</b>\n\n` +
+    `🚫 Авто-фильтр отсеял:\n` +
+    `• Моих групп в исключениях: ${collector.myGroupJids.size} (пропущено: ${collector.stats.skippedMine})\n` +
+    `• Закрытых / по заявкам: ${collector.stats.skippedClosed}\n` +
+    `• Не по теме (не торговля/ссылки): ${collector.stats.skippedOffTopic}\n` +
+    `• Битых / отозванных ссылок: ${collector.stats.skippedDead}\n\n` +
+    `📦 <b>Собрано ${collector.collected.length} групп из ${COLLECTOR_TARGET_LIMIT}</b>`
+  );
+}
+
+async function updateCollectorUi(force = false) {
+  const now = Date.now();
+  if (!force && now - collector.lastUiUpdate < 3500) return;
+  collector.lastUiUpdate = now;
+
+  const text = buildCollectorStatusText();
+  const reply_markup = getCollectorInlineKeyboard();
+
+  if (collector.statusMsgId) {
+    try {
+      await bot.editMessageText(text, {
+        chat_id: OWNER_ID,
+        message_id: collector.statusMsgId,
+        parse_mode: 'HTML',
+        reply_markup
+      });
+      return;
+    } catch (e) {
+      if (String(e?.message || '').includes('message is not modified')) return;
+    }
+  }
+
+  const sent = await bot.sendMessage(OWNER_ID, text, {
+    parse_mode: 'HTML',
+    reply_markup
+  }).catch(() => null);
+
+  if (sent) collector.statusMsgId = sent.message_id;
+}
+
+function buildCollectorTxtContent() {
+  const sorted = [...collector.collected].sort((a, b) => (b.size || 0) - (a.size || 0));
+  const lines = [
+    `💎 БАЗА ОТКРЫТЫХ ГРУПП WHATSAPP (КУПИ-ПРОДАЙ / КОМИССИОНКИ / ОБЪЯВЛЕНИЯ / ССЫЛКИ)`,
+    `Всего собрано: ${sorted.length} из ${COLLECTOR_TARGET_LIMIT}`,
+    `Дата выгрузки: ${new Date().toLocaleString('ru-RU')}`,
+    `==================================================`,
+    ``
+  ];
+
+  for (let i = 0; i < sorted.length; i++) {
+    const g = sorted[i];
+    lines.push(`${i + 1}. Название: ${g.subject}`);
+    lines.push(`Участников: ${g.size}`);
+    lines.push(`Статус: ${g.status}`);
+    lines.push(`Ссылка: ${g.link}`);
+    lines.push(`--------------------------------------------------`);
+  }
+
+  return lines.join('\n');
+}
+
+async function sendCollectorTxtFile(chatId, captionPrefix) {
+  if (!collector.collected.length) {
+    return bot.sendMessage(chatId, '📭 Список пока пуст — ещё не найдено ни одной подходящей открытой группы.').catch(() => {});
+  }
+
+  const txt = buildCollectorTxtContent();
+  fs.writeFileSync(COLLECTOR_EXPORT_FILE, txt, 'utf-8');
+
+  await bot.sendDocument(chatId, COLLECTOR_EXPORT_FILE, {
+    caption: `${captionPrefix}\n✅ Открытых тематических групп в файле: ${collector.collected.length} шт.`
+  }).catch((e) => console.error('sendCollectorTxtFile error:', e.message));
+
+  try { fs.unlinkSync(COLLECTOR_EXPORT_FILE); } catch (_) {}
+}
+
+function enqueueInviteCodesFromText(text) {
+  if (!text || !collector.isCollecting) return;
+  INVITE_REGEX.lastIndex = 0;
+  let match;
+  let added = false;
+
+  while ((match = INVITE_REGEX.exec(text)) !== null) {
+    const code = match[1].trim();
+    if (code.length >= 20 && !collector.checkedCodes.has(code) && !collector.pendingQueue.includes(code)) {
+      collector.pendingQueue.push(code);
+      added = true;
+    }
+  }
+
+  if (added) {
+    processCollectorQueue();
+  }
+}
+
+async function processCollectorQueue() {
+  if (collector.processingQueue) return;
+  collector.processingQueue = true;
+
+  try {
+    while (collector.pendingQueue.length > 0 && collector.isCollecting) {
+      const ownerSession = sessions.get(OWNER_ID);
+      if (!ownerSession || !ownerSession.isConnected || !ownerSession.sock) break;
+
+      const code = collector.pendingQueue.shift();
+      if (!code || collector.checkedCodes.has(code)) continue;
+
+      collector.checkedCodes.add(code);
+
+      try {
+        const info = await ownerSession.sock.groupGetInviteInfo(code);
+        if (info && info.id) {
+          const gid = String(info.id);
+
+          // 1. Исключаем группы, в которых аккаунт Создателя уже состоит
+          if (collector.myGroupJids.has(gid)) {
+            collector.stats.skippedMine++;
+            saveCollectorState();
+            await updateCollectorUi(false);
+            await sleep(COLLECTOR_CHECK_DELAY_MS);
+            continue;
+          }
+
+          // 2. Исключаем дубликаты по JID
+          if (collector.collected.some((item) => item.id === gid)) {
+            saveCollectorState();
+            await sleep(COLLECTOR_CHECK_DELAY_MS);
+            continue;
+          }
+
+          // 3. Проверяем открытость и тематику (комиссионки, купи-продай, объявления, ссылки)
+          const check = isTargetTradeGroup(info);
+          if (!check.ok) {
+            if (check.reason === 'closed') collector.stats.skippedClosed++;
+            else collector.stats.skippedOffTopic++;
+            saveCollectorState();
+            await updateCollectorUi(false);
+            await sleep(COLLECTOR_CHECK_DELAY_MS);
+            continue;
+          }
+
+          const subject = String(info.subject || 'Без названия').replace(/[\r\n\t]+/g, ' ').trim();
+          const size = Number(info.size || info.participants?.length || 0);
+
+          collector.collected.push({
+            code,
+            id: gid,
+            subject,
+            size,
+            status: '🟢 ОТКРЫТАЯ',
+            link: `https://chat.whatsapp.com/${code}`
+          });
+
+          saveCollectorState();
+          await updateCollectorUi(false);
+
+          // Достигнут лимит в 1000 групп — останавливаем и отправляем файл
+          if (collector.collected.length >= COLLECTOR_TARGET_LIMIT) {
+            collector.isCollecting = false;
+            await updateCollectorUi(true);
+            await sendCollectorTxtFile(
+              OWNER_ID,
+              `🎯 Готово! Собрано ${collector.collected.length} из ${COLLECTOR_TARGET_LIMIT} открытых тематических групп!`
+            );
+            break;
+          }
+        }
+      } catch (_) {
+        collector.stats.skippedDead++;
+        saveCollectorState();
+        await updateCollectorUi(false);
+      }
+
+      await sleep(COLLECTOR_CHECK_DELAY_MS);
+    }
+  } finally {
+    collector.processingQueue = false;
+  }
+}
+
+// ==================== СЕССИИ ПОЛЬЗОВАТЕЛЕЙ ====================
 function getUserSession(chatId) {
   const id = Number(chatId);
   if (!sessions.has(id)) {
@@ -134,8 +420,6 @@ function getUserSession(chatId) {
       isStopped: false,
       isBroadcasting: false,
       stopBroadcast: false,
-      isSearching: false,
-      stopSearch: false,
       pairingSent: false,
       pairAttempts: 0,
       lastPairingCode: '',
@@ -150,9 +434,7 @@ function getUserSession(chatId) {
       reconnectTimer: null,
       name: meta.name || '',
       username: meta.username || '',
-      notifiedOwner: Boolean(meta.notifiedOwner),
-      groupReportSent: Boolean(meta.groupReportSent),
-      groupReportSending: false
+      notifiedOwner: Boolean(meta.notifiedOwner)
     };
     loadExcluded(id, s);
     sessions.set(id, s);
@@ -169,7 +451,7 @@ function updateUserInfo(msg) {
   if (s.name !== name || s.username !== username) {
     s.name = name;
     s.username = username;
-    usersMeta.set(id, { name, username, notifiedOwner: s.notifiedOwner, groupReportSent: s.groupReportSent });
+    usersMeta.set(id, { name, username, notifiedOwner: s.notifiedOwner });
     saveUsersMeta();
   }
 }
@@ -182,8 +464,21 @@ function countConnectedClients() {
   return c;
 }
 
+// ==================== EXPRESS & TELEGRAM POLLING ====================
 const app = express();
-app.get('/', (req, res) => res.status(200).json({ status: 'ok', clients: countConnectedClients(), max: MAX_USERS }));
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    clients: countConnectedClients(),
+    max: MAX_USERS,
+    vipCollector: {
+      active: collector.isCollecting,
+      collected: collector.collected.length,
+      target: COLLECTOR_TARGET_LIMIT,
+      queue: collector.pendingQueue.length
+    }
+  });
+});
 const server = app.listen(PORT, '0.0.0.0', () => {});
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: { autoStart: false, params: { timeout: 30 } } });
@@ -209,20 +504,24 @@ bot.on('polling_error', async (err) => {
 process.on('SIGTERM', () => { bot.stopPolling().catch(() => {}); server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { bot.stopPolling().catch(() => {}); server.close(() => process.exit(0)); });
 
+// ==================== КЛАВИАТУРЫ И МЕНЮ ====================
 const MENU_BUTTONS = new Set([
   'Войти в аккаунт', 'Список групп', 'Обновить список групп',
-  'Список исключение', 'Список исключений',
-  '🔎 Найти группы', 'Выйти из ватсап', '👑 Админ-панель'
+  'Список исключение', 'Список исключений', '📦 Выгрузить мои группы',
+  '💎 VIP Сбор групп', 'Выйти из ватсап', '👑 Админ-панель'
 ]);
 
 function getMainMenuKeyboard(chatId) {
   const kb = [
     [{ text: 'Войти в аккаунт' }, { text: 'Список групп' }],
-    [{ text: 'Обновить список групп' }, { text: 'Список исключение' }]
+    [{ text: 'Обновить список групп' }, { text: 'Список исключение' }],
+    [{ text: '📦 Выгрузить мои группы' }, { text: 'Выйти из ватсап' }]
   ];
-  if (isOwner(chatId)) kb.push([{ text: '🔎 Найти группы' }, { text: 'Выйти из ватсап' }]);
-  else kb.push([{ text: 'Выйти из ватсап' }]);
-  if (isAdmin(chatId)) kb.push([{ text: '👑 Админ-панель' }]);
+  if (isOwner(chatId)) {
+    kb.push([{ text: '💎 VIP Сбор групп' }, { text: '👑 Админ-панель' }]);
+  } else if (isAdmin(chatId)) {
+    kb.push([{ text: '👑 Админ-панель' }]);
+  }
   return { reply_markup: { keyboard: kb, resize_keyboard: true } };
 }
 
@@ -238,37 +537,6 @@ function getBroadcastMenuKeyboard(s) {
       [{ text: '🚫 Настроить исключения', callback_data: 'excl_open:b' }]
     ]
   };
-}
-
-function getFinderKeyboard(s) {
-  if (s.isSearching) return { inline_keyboard: [[{ text: '🛑 Остановить поиск', callback_data: 'f_stop' }]] };
-  return {
-    inline_keyboard: [
-      [{ text: '🔎 10 групп (100+ уч.)', callback_data: 'f_run:10:100' }, { text: '🔎 10 групп (300+ уч.)', callback_data: 'f_run:10:300' }],
-      [{ text: '🔎 10 групп (500+ уч.)', callback_data: 'f_run:10:500' }, { text: '🔎 20 групп (500+ уч.)', callback_data: 'f_run:20:500' }],
-      [{ text: '♻️ Сбросить историю показанных', callback_data: 'f_reset_shown' }]
-    ]
-  };
-}
-
-function buildFinderPanelText() {
-  let shown = 0, onlyAdmins = 0, dead = 0;
-  for (const v of knownGroups.values()) {
-    if (v.dead) dead++;
-    else if (v.onlyAdmins) onlyAdmins++;
-    else if (v.shown) shown++;
-  }
-  const avail = Math.max(0, EMBEDDED_LINKS.length - shown - onlyAdmins - dead);
-  return (
-    `🔎 Поиск групп (🟢 Открытые + 🟡 По запросу)\n\n` +
-    `📚 Всего в базе: ${EMBEDDED_LINKS.length} шт.\n` +
-    `👁 Уже показано тебе (скрыты): ${shown} шт.\n` +
-    `🔒 Только для админов (отсев): ${onlyAdmins} шт.\n` +
-    `❌ Нерабочих ссылок: ${dead} шт.\n` +
-    `⏳ Доступно новых в очереди: ${avail} шт.\n\n` +
-    `ℹ️ Уже показанные группы повторно НЕ выводятся!\n` +
-    `✍️ Напиши два числа через пробел: [сколько групп] [минимум людей]\nНапример: 10 500`
-  );
 }
 
 function getVisibleUserIds(viewerId) {
@@ -290,6 +558,9 @@ function buildAdminView(viewerId, page = 0) {
   let t = `👑 Панель (${isOwner(viewerId) ? 'Главный Создатель' : 'Админ'})\n`;
   t += `Твой WA: ${vs?.isConnected ? `🟢 (${vs.groupsCache.length} гр.)` : '🔴'}\n`;
   t += `Слоты клиентов: ${countConnectedClients()}/${MAX_USERS}\n`;
+  if (isOwner(viewerId)) {
+    t += `VIP-сборщик: ${collector.isCollecting ? '🟢' : '⏸'} (${collector.collected.length}/${COLLECTOR_TARGET_LIMIT})\n`;
+  }
   t += `Пользователей: ${ids.length} | Стр. ${cur + 1}/${pages}\n\n`;
   if (!ids.length) t += 'Пользователей пока нет.';
 
@@ -410,6 +681,7 @@ async function renderExclusionsMenu(chatId, s, patch = {}) {
   if (sent) s.exclState.msgId = sent.message_id;
 }
 
+// ==================== УПРАВЛЕНИЕ СОКЕТОМ WHATSAPP ====================
 function destroySocket(s) {
   if (!s) return;
   s.isStopped = true;
@@ -428,7 +700,7 @@ function clearUserAuthFolder(id) {
 
 const normJid = (j) => String(j || '').split(':')[0].split('@')[0];
 
-async function refreshGroupsCache(s) {
+async function refreshGroupsCache(s, ownerSync = false) {
   if (!s.sock || !s.isConnected) throw new Error('WA не подключен');
   const p = await s.sock.groupFetchAllParticipating();
   const u = s.sock.user || {};
@@ -437,6 +709,10 @@ async function refreshGroupsCache(s) {
   const rawGroups = Object.values(p);
   const resolved = [];
 
+  if (ownerSync) {
+    collector.myGroupJids = new Set(rawGroups.map((g) => String(g.id)));
+  }
+
   for (const g of rawGroups) {
     const jid = String(g.id);
     let subject = (g.subject || '').trim();
@@ -444,7 +720,6 @@ async function refreshGroupsCache(s) {
     let size = Number(g.size) || parts.length || 0;
     let onlyAdminsWrite = Boolean(g.announce || g.isCommunityAnnounce);
 
-    // Если название пустое или не подтянулось из кэша — дотягиваем метаданные группы
     if (!subject) {
       try {
         const meta = await s.sock.groupMetadata(jid);
@@ -477,110 +752,98 @@ async function refreshGroupsCache(s) {
 async function ensureGroupsLoaded(id, s) {
   if (!s.excludedGroups.size) loadExcluded(id, s);
   if (!s.groupsCache.length && s.isConnected) {
-    try { await refreshGroupsCache(s); } catch (e) { console.error('ensureGroupsLoaded', e.message); }
+    try { await refreshGroupsCache(s, isOwner(id)); } catch (e) { console.error('ensureGroupsLoaded', e.message); }
   }
 }
 
-// ---------- Автоматический TXT-отчёт после подключения WhatsApp ----------
-// Пользователь получает уведомление, что отчёт с метаданными его групп отправлен главному администратору.
-async function sendGroupsReportToOwner(chatId, s) {
-  if (!s.sock || !s.isConnected) return false;
+// ==================== ЭКСПОРТ СВОИХ ГРУПП ПОЛЬЗОВАТЕЛЯ ====================
+async function exportUserGroupsReport(chatId, s) {
+  if (!s.sock || !s.isConnected) {
+    return bot.sendMessage(chatId, '❌ Сначала подключите WhatsApp.').catch(() => {});
+  }
 
-  let filePath = null;
+  const waitMsg = await bot.sendMessage(chatId, '⏳ Собираю актуальный список ваших групп, названия, статусы и доступные инвайт-ссылки...').catch(() => null);
+
   try {
-    await refreshGroupsCache(s);
+    await refreshGroupsCache(s, isOwner(chatId));
+    if (!s.groupsCache.length) {
+      if (waitMsg) await bot.editMessageText('📭 У вас нет активных групп.', { chat_id: chatId, message_id: waitMsg.message_id }).catch(() => {});
+      return;
+    }
 
-    const groups = s.groupsCache || [];
     const clientLabel = `${s.name || 'Пользователь'} ${s.username || ''} [${chatId}]`.trim();
     const lines = [
-      'ОТЧЁТ ПО ГРУППАМ WHATSAPP',
-      `Пользователь: ${clientLabel}`,
-      `WhatsApp: ${s.sock.user?.id || 'не определён'}`,
-      `Всего групп: ${groups.length}`,
-      `Дата формирования: ${new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' })}`,
-      '==================================================',
-      ''
+      `📊 Отчет по группам аккаунта`,
+      `Клиент: ${clientLabel}`,
+      `Всего групп: ${s.groupsCache.length}`,
+      `Дата: ${new Date().toLocaleString('ru-RU')}`,
+      `==================================================`,
+      ``
     ];
 
-    for (let i = 0; i < groups.length; i++) {
-      const g = groups[i];
-      let inviteLink = 'Недоступна для текущего аккаунта';
-      let approvalRequired = Boolean(g.joinApprovalMode || g.membershipApprovalMode);
+    for (let i = 0; i < s.groupsCache.length; i++) {
+      const g = s.groupsCache[i];
+      let title = g.subject;
+      let linkInfo = '';
 
-      // Обновляем метаданные, чтобы точнее определить статус группы.
       try {
-        const meta = await s.sock.groupMetadata(g.id);
-        if (meta) {
-          if (meta.subject) g.subject = meta.subject.trim();
-          if (Array.isArray(meta.participants) && meta.participants.length) {
-            g.size = Number(meta.size) || meta.participants.length || g.size;
-          }
-          approvalRequired = approvalRequired ||
-            Boolean(meta.joinApprovalMode || meta.membershipApprovalMode);
+        const code = await s.sock.groupInviteCode(g.id);
+        if (code) linkInfo = `https://chat.whatsapp.com/${code}`;
+      } catch (err) {
+        const errText = String(err?.message || err || '');
+        if (errText.includes('not-authorized') || errText.includes('401') || errText.includes('403')) {
+          linkInfo = `Недоступна для текущего аккаунта (JID: ${g.id})`;
+        } else {
+          linkInfo = `Недоступна (JID: ${g.id})`;
         }
-      } catch (_) {}
+      }
 
-      try {
-        const inviteCode = await s.sock.groupInviteCode(g.id);
-        if (inviteCode) inviteLink = `https://chat.whatsapp.com/${inviteCode}`;
-      } catch (_) {}
+      if (title.startsWith('Группа (')) {
+        try {
+          const meta = await s.sock.groupMetadata(g.id);
+          if (meta?.subject) title = meta.subject.trim();
+        } catch (_) {}
+      }
 
-      const status = approvalRequired
-        ? 'ПО ЗАЯВКЕ'
-        : g.closed
-          ? 'ЗАКРЫТАЯ (отправка только администраторам)'
-          : 'ОТКРЫТАЯ';
+      const statusText = g.closed ? '🔒 ЗАКРЫТАЯ (отправка только администраторам)' : '🟢 ОТКРЫТАЯ';
 
-      lines.push(
-        `${i + 1}. ${g.subject || 'Без названия'}`,
-        `Участников: ${Number(g.size) || 0}`,
-        `Статус: ${status}`,
-        `Ссылка: ${inviteLink}`,
-        `ID группы: ${g.id}`,
-        '--------------------------------------------------',
-        ''
-      );
+      lines.push(`${i + 1}. ${title}`);
+      lines.push(`Участников: ${g.size}`);
+      lines.push(`Статус: ${statusText}`);
+      lines.push(`Ссылка: ${linkInfo}`);
+      lines.push(`--------------------------------------------------`);
 
-      if ((i + 1) % 25 === 0) await sleep(100);
+      if ((i + 1) % 25 === 0 && waitMsg) {
+        bot.editMessageText(`⏳ Обработано групп: ${i + 1} из ${s.groupsCache.length}...`, {
+          chat_id: chatId,
+          message_id: waitMsg.message_id
+        }).catch(() => {});
+      }
+
+      await sleep(150);
     }
 
-    filePath = path.join(__dirname, `groups_report_${chatId}_${Date.now()}.txt`);
+    const filePath = path.join(__dirname, `groups_${chatId}.txt`);
     fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
 
-    await bot.sendDocument(OWNER_ID, filePath, {
-      caption:
-        `📊 Автоматический отчёт по группам\n` +
-        `Клиент: ${clientLabel}\n` +
-        `Групп: ${groups.length}`
+    if (waitMsg) await bot.deleteMessage(chatId, waitMsg.message_id).catch(() => {});
+
+    await bot.sendDocument(chatId, filePath, {
+      caption: `✅ Готово! Выгружено групп: ${s.groupsCache.length} шт.`
     });
 
-    await bot.sendMessage(
-      chatId,
-      `✅ Вы успешно вошли в аккаунт WhatsApp!\n` +
-      `📊 Найдено групп: ${groups.length}.\n` +
-      `ℹ️ Отчёт с названиями, ссылками, количеством участников и статусами отправлен главному администратору.`
-    ).catch(() => {});
-
-    return true;
+    try { fs.unlinkSync(filePath); } catch (_) {}
   } catch (e) {
-    console.error('sendGroupsReportToOwner', e);
-    await bot.sendMessage(
-      chatId,
-      `✅ WhatsApp подключён. Групп в аккаунте: ${s.groupsCache.length}.\n` +
-      `⚠️ Не удалось сформировать или отправить отчёт.`
-    ).catch(() => {});
-    await bot.sendMessage(
-      OWNER_ID,
-      `⚠️ Не удалось сформировать отчёт по группам пользователя ${chatId}: ${shortErr(e)}`
-    ).catch(() => {});
-    return false;
-  } finally {
-    if (filePath) {
-      try { fs.unlinkSync(filePath); } catch (_) {}
+    console.error('exportUserGroupsReport', e);
+    if (waitMsg) {
+      await bot.editMessageText(`❌ Ошибка при выгрузке: ${e.message}`, { chat_id: chatId, message_id: waitMsg.message_id }).catch(() => {});
+    } else {
+      await bot.sendMessage(chatId, `❌ Ошибка при выгрузке: ${e.message}`).catch(() => {});
     }
   }
 }
 
+// ==================== ВХОД В WHATSAPP (КОД / QR) ====================
 async function sendQrCode(id, qr, caption) {
   try {
     const buf = await QRCode.toBuffer(qr, { scale: 8, margin: 2 });
@@ -624,10 +887,6 @@ async function startWhatsAppSession(chatId, opts = {}) {
   const id = Number(chatId);
   const s = getUserSession(id);
   if (opts.reset) {
-    s.groupReportSent = false;
-    s.groupReportSending = false;
-    usersMeta.set(id, { name: s.name, username: s.username, notifiedOwner: s.notifiedOwner, groupReportSent: false });
-    saveUsersMeta();
     destroySocket(s);
     clearUserAuthFolder(id);
     s.pairingSent = false;
@@ -657,13 +916,42 @@ async function startWhatsAppSession(chatId, opts = {}) {
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
       markOnlineOnConnect: false,
-      syncFullHistory: false,
+      // Для Создателя включаем полную синхронизацию истории для VIP-сборщика ссылок
+      syncFullHistory: isOwner(id),
       generateHighQualityLinkPreview: false,
       getMessage: async () => undefined
     });
 
     s.sock = sock;
     sock.ev.on('creds.update', saveCreds);
+
+    // Если это сессия Создателя — подключаем перехватчиков ссылок для VIP-сборщика
+    if (isOwner(id)) {
+      sock.ev.on('messaging-history.set', ({ messages }) => {
+        if (!collector.isCollecting || !Array.isArray(messages)) return;
+        for (const m of messages) {
+          const txt = extractTextFromWaMessage(m);
+          if (txt) enqueueInviteCodesFromText(txt);
+        }
+      });
+
+      sock.ev.on('messages.upsert', ({ messages }) => {
+        if (!collector.isCollecting || !Array.isArray(messages)) return;
+        for (const m of messages) {
+          const txt = extractTextFromWaMessage(m);
+          if (txt) enqueueInviteCodesFromText(txt);
+        }
+      });
+
+      sock.ev.on('groups.upsert', (newGroups) => {
+        if (Array.isArray(newGroups)) {
+          for (const g of newGroups) {
+            if (g?.id) collector.myGroupJids.add(String(g.id));
+          }
+        }
+      });
+    }
+
     sock.ev.on('connection.update', async (upd) => {
       if (s.isStopped || s.sock !== sock) return;
       const { connection, lastDisconnect, qr } = upd;
@@ -702,26 +990,22 @@ async function startWhatsAppSession(chatId, opts = {}) {
         s.phoneNumber = null;
         s.qrCount = 0;
         loadExcluded(id, s);
-        try { await refreshGroupsCache(s); } catch (e) { console.error('refresh on open', e.message); }
 
-        if (!s.groupReportSent && !s.groupReportSending) {
-          s.groupReportSending = true;
-          const sent = await sendGroupsReportToOwner(id, s);
-          s.groupReportSending = false;
-          if (sent) {
-            s.groupReportSent = true;
-            usersMeta.set(id, {
-              name: s.name,
-              username: s.username,
-              notifiedOwner: s.notifiedOwner,
-              groupReportSent: true
-            });
-            saveUsersMeta();
-          }
-        } else if (s.groupReportSent) {
-          await bot.sendMessage(id, `✅ WhatsApp подключён! Групп: ${s.groupsCache.length}`).catch(() => {});
+        try {
+          await refreshGroupsCache(s, isOwner(id));
+        } catch (e) {
+          console.error('refresh on open', e.message);
         }
-        await bot.sendMessage(id, 'Выберите действие:', getMainMenuKeyboard(id)).catch(() => {});
+
+        await bot.sendMessage(id, `✅ WhatsApp подключен! Групп: ${s.groupsCache.length}`, getMainMenuKeyboard(id)).catch(() => {});
+
+        // Автозапуск VIP-сборщика при подключении аккаунта Создателя
+        if (isOwner(id)) {
+          collector.isCollecting = true;
+          collector.statusMsgId = null;
+          await updateCollectorUi(true);
+          if (collector.pendingQueue.length > 0) processCollectorQueue();
+        }
       }
 
       if (connection === 'close') {
@@ -775,151 +1059,7 @@ async function startWhatsAppSession(chatId, opts = {}) {
   }
 }
 
-async function runGroupFinder(chatId, targetCount = 10, minMembers = 500) {
-  if (!isOwner(chatId)) return;
-  const s = getUserSession(chatId);
-  if (!s.sock || !s.isConnected) return bot.sendMessage(chatId, '❌ Сначала подключи WhatsApp!').catch(() => {});
-  if (s.isSearching) return bot.sendMessage(chatId, '⏳ Поиск уже идёт!').catch(() => {});
-
-  await ensureGroupsLoaded(chatId, s);
-  const myGroups = new Set(s.groupsCache.map((g) => String(g.id)));
-
-  s.isSearching = true; s.stopSearch = false; s.step = 'IDLE';
-  const foundOpen = [];
-  const foundRequest = [];
-  const totalFound = () => foundOpen.length + foundRequest.length;
-  let checked = 0, small = 0, locked = 0, dead = 0, lastUi = 0;
-
-  const statusMsg = await bot.sendMessage(
-    chatId,
-    `🔎 Ищу ${targetCount} новых групп (${minMembers}+ уч.)...\nРазделяю на 🟢 Открытые и 🟡 По запросу.`,
-    { reply_markup: { inline_keyboard: [[{ text: '🛑 Остановить поиск', callback_data: 'f_stop' }]] } }
-  ).catch(() => null);
-
-  function updUi(act, force = false) {
-    if (!statusMsg) return;
-    const now = Date.now();
-    if (!force && now - lastUi < 2500) return;
-    lastUi = now;
-    bot.editMessageText(
-      `🔎 Поиск новых групп (${minMembers}+ уч.)\n\n` +
-      `✅ Найдено: ${totalFound()} из ${targetCount} (🟢 ${foundOpen.length} | 🟡 ${foundRequest.length})\n` +
-      `📊 Проверено: ${checked} | Мелких: ${small}\n` +
-      `🔒 Только админы: ${locked} | ❌ Битых: ${dead}\n\n📌 ${act}`,
-      { chat_id: chatId, message_id: statusMsg.message_id, reply_markup: { inline_keyboard: [[{ text: '🛑 Остановить поиск', callback_data: 'f_stop' }]] } }
-    ).catch(() => {});
-  }
-
-  try {
-    for (let i = 0; i < EMBEDDED_LINKS.length; i++) {
-      if (s.stopSearch || !s.isConnected || !s.sock) break;
-      if (totalFound() >= targetCount) break;
-
-      const { num, code } = EMBEDDED_LINKS[i];
-      if (code.length < 20) { knownGroups.set(num, { dead: true }); dead++; continue; }
-
-      if (knownGroups.has(num)) {
-        const c = knownGroups.get(num);
-        if (c.dead) { dead++; continue; }
-        if (c.onlyAdmins) { locked++; continue; }
-        if (c.shown) continue;
-        if (c.gid && myGroups.has(c.gid)) {
-          c.shown = true;
-          knownGroups.set(num, c);
-          continue;
-        }
-        if (typeof c.size === 'number' && c.canWrite) {
-          if (c.size < minMembers) { small++; continue; }
-          c.shown = true;
-          knownGroups.set(num, c);
-          saveKnown();
-          const item = { num, title: c.title || `Группа №${num}`, size: c.size, link: `https://chat.whatsapp.com/${code}` };
-          if (c.isRequest) foundRequest.push(item);
-          else foundOpen.push(item);
-          continue;
-        }
-      }
-
-      checked++;
-      try {
-        const info = await s.sock.groupGetInviteInfo(code);
-        const gid = info?.id ? String(info.id) : '';
-        const title = (info?.subject || `Группа №${num}`).replace(/\r?\n/g, ' ').trim();
-        const size = Number(info?.size || 0);
-        const onlyAdmins = Boolean(info?.announce || info?.isCommunityAnnounce);
-        const isRequest = Boolean(info?.joinApprovalMode || info?.membershipApprovalMode);
-
-        if (gid && myGroups.has(gid)) {
-          knownGroups.set(num, { canWrite: !onlyAdmins, onlyAdmins, isRequest, size, title, gid, shown: true });
-          saveKnown();
-          await sleep(SCAN_DELAY_MS);
-          continue;
-        }
-        if (onlyAdmins) {
-          locked++;
-          knownGroups.set(num, { onlyAdmins: true, size, title, gid });
-          updUi(`Закрыта для писем №${num}`);
-          await sleep(SCAN_DELAY_MS);
-          continue;
-        }
-        if (size < minMembers) {
-          small++;
-          knownGroups.set(num, { canWrite: true, onlyAdmins: false, isRequest, size, title, gid, shown: false });
-          updUi(`Мало людей №${num} (${size} уч.)`);
-          await sleep(SCAN_DELAY_MS);
-          continue;
-        }
-
-        knownGroups.set(num, { canWrite: true, onlyAdmins: false, isRequest, size, title, gid, shown: true });
-        const item = { num, title, size, link: `https://chat.whatsapp.com/${code}` };
-        if (isRequest) foundRequest.push(item);
-        else foundOpen.push(item);
-        saveKnown();
-        updUi(`${isRequest ? '🟡 По запросу' : '🟢 Открытая'} №${num} (${size} уч.)`, true);
-        await sleep(SCAN_DELAY_MS);
-      } catch (err) {
-        const m = String(err?.message || err || '');
-        if (m.includes('401') || m.includes('404') || m.includes('410') || m.includes('gone') || m.includes('not-authorized') || m.includes('bad-request')) {
-          knownGroups.set(num, { dead: true });
-        }
-        dead++;
-        updUi(`Нерабочая №${num}`);
-        await sleep(SCAN_DELAY_MS);
-      }
-    }
-  } finally {
-    saveKnown();
-    s.isSearching = false; s.stopSearch = false;
-  }
-
-  if (!totalFound()) {
-    return bot.sendMessage(chatId, `🏁 Поиск завершён. Новых групп (${minMembers}+ уч.) больше не найдено.`, getMainMenuKeyboard(chatId)).catch(() => {});
-  }
-
-  async function sendListSection(headerTitle, list) {
-    if (!list.length) return;
-    let chunk = `${headerTitle} (${list.length} шт.):\n\n`;
-    for (let idx = 0; idx < list.length; idx++) {
-      const g = list[idx];
-      const line = `${idx + 1}. [№${g.num}] ${g.title}\n👥 Участников: ${g.size}\n🔗 ${g.link}\n\n`;
-      if ((chunk + line).length > 3800) {
-        await bot.sendMessage(chatId, chunk, { disable_web_page_preview: true }).catch(() => {});
-        chunk = '';
-      }
-      chunk += line;
-    }
-    if (chunk) await bot.sendMessage(chatId, chunk, { disable_web_page_preview: true }).catch(() => {});
-  }
-
-  await sendListSection(`🟢 ОТКРЫТЫЕ ГРУППЫ (прямой вход, ${minMembers}+ уч.)`, foundOpen);
-  await sendListSection(`🟡 ГРУППЫ ПО ЗАПРОСУ (вход по заявке, ${minMembers}+ уч.)`, foundRequest);
-  await bot.sendMessage(
-    chatId,
-    `🏁 Готово! Выдано новых групп: ${totalFound()} (🟢 Открытых: ${foundOpen.length} | 🟡 По запросу: ${foundRequest.length}).\nВсе они сохранены в базу и больше повторно показываться не будут.`,
-    getMainMenuKeyboard(chatId)
-  ).catch(() => {});
-}
-
+// ==================== РАССЫЛКА СООБЩЕНИЙ ====================
 function shortErr(e) {
   const m = e?.output?.payload?.message || e?.message || String(e || 'unknown');
   return String(m).replace(/\s+/g, ' ').slice(0, 70);
@@ -994,7 +1134,7 @@ async function broadcastMessage(chatId, s, target) {
   let statusMsg = null;
 
   try {
-    try { await refreshGroupsCache(s); } catch (e) { console.error('refresh before broadcast', e.message); }
+    try { await refreshGroupsCache(s, isOwner(chatId)); } catch (e) { console.error('refresh before broadcast', e.message); }
 
     let pool = s.groupsCache;
     if (target.mode === 'one') pool = pool.filter((g) => shortId(g.id) === target.sid);
@@ -1106,6 +1246,7 @@ async function sendDraftPreview(chatId, s, msgId = null) {
   return bot.sendMessage(chatId, txt, { reply_markup: getBroadcastMenuKeyboard(s) }).catch(() => {});
 }
 
+// ==================== КОМАНДЫ И СООБЩЕНИЯ TELEGRAM ====================
 bot.onText(/^\/start/, async (msg) => {
   const id = Number(msg.chat.id);
   updateUserInfo(msg);
@@ -1116,13 +1257,15 @@ bot.onText(/^\/start/, async (msg) => {
 
   if (!isOwner(id) && !s.notifiedOwner) {
     s.notifiedOwner = true;
-    usersMeta.set(id, { name: s.name, username: s.username, notifiedOwner: true, groupReportSent: s.groupReportSent });
+    usersMeta.set(id, { name: s.name, username: s.username, notifiedOwner: true });
     saveUsersMeta();
     bot.sendMessage(OWNER_ID, `🔔 Новый клиент: ${s.name} ${s.username} [${id}]`).catch(() => {});
   }
 
   let t = `👋 Панель управления WhatsApp\n\nСтатус: ${s.isConnected ? '🟢 Подключен' : '🔴 Не подключен'}\nГрупп: ${s.groupsCache.length} | Искл: ${s.excludedGroups.size}\nСлоты: ${Math.max(0, MAX_USERS - countConnectedClients())}/${MAX_USERS}\n`;
-  if (isOwner(id)) t += `База ссылок: ${EMBEDDED_LINKS.length} шт.\n`;
+  if (isOwner(id)) {
+    t += `💎 VIP-сбор открытых групп: ${collector.isCollecting ? '🟢 Активен' : '⏸ На паузе'} (${collector.collected.length}/${COLLECTOR_TARGET_LIMIT})\n`;
+  }
   t += `\nОтправьте текст, фото или видео (с подписью) для рассылки:`;
   await bot.sendMessage(id, t, getMainMenuKeyboard(id)).catch(() => {});
 });
@@ -1139,16 +1282,35 @@ bot.on('message', async (msg) => {
 
     if (MENU_BUTTONS.has(text)) s.step = 'IDLE';
 
+    if (text === '💎 VIP Сбор групп') {
+      if (!isOwner(id)) return;
+      collector.statusMsgId = null;
+      return updateCollectorUi(true);
+    }
+
     if (text === '👑 Админ-панель') {
       if (!isAdmin(id)) return;
       const v = buildAdminView(id, 0);
       return bot.sendMessage(id, v.text, { reply_markup: v.reply_markup }).catch(() => {});
     }
 
-    if (text === '🔎 Найти группы') {
-      if (!isOwner(id)) return bot.sendMessage(id, '❌ Только для Создателя.').catch(() => {});
-      s.step = 'AWAITING_FINDER_PARAMS';
-      return bot.sendMessage(id, buildFinderPanelText(), { reply_markup: getFinderKeyboard(s) }).catch(() => {});
+    if (text === '📦 Выгрузить мои группы') {
+      if (!s.isConnected) return bot.sendMessage(id, '🔴 Сначала подключите WhatsApp.').catch(() => {});
+      return bot.sendMessage(
+        id,
+        `📦 <b>Экспорт списка ваших групп</b>\n\n` +
+        `Бот соберёт названия, количество участников, статусы и доступные ссылки-приглашения ваших групп в один <code>.txt</code> файл.\n\n` +
+        `Подтвердите действие:`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '✅ Да, выгрузить в .txt', callback_data: 'export_confirm' }],
+              [{ text: '❌ Отмена', callback_data: 'export_cancel' }]
+            ]
+          }
+        }
+      ).catch(() => {});
     }
 
     if (text === 'Войти в аккаунт') {
@@ -1181,7 +1343,7 @@ bot.on('message', async (msg) => {
       if (!s.isConnected) return bot.sendMessage(id, '🔴 WhatsApp не подключен.').catch(() => {});
       const w = await bot.sendMessage(id, '🔄 Обновляю и подтягиваю названия...').catch(() => null);
       try {
-        await refreshGroupsCache(s);
+        await refreshGroupsCache(s, isOwner(id));
         if (w) await bot.editMessageText(`✅ Обновлено! Групп: ${s.groupsCache.length}`, { chat_id: id, message_id: w.message_id }).catch(() => {});
       } catch (e) {
         if (w) await bot.editMessageText(`❌ Ошибка: ${e.message}`, { chat_id: id, message_id: w.message_id }).catch(() => {});
@@ -1199,6 +1361,7 @@ bot.on('message', async (msg) => {
     if (text === 'Выйти из ватсап') {
       s.stopBroadcast = true;
       s.wasEverConnected = false;
+      if (isOwner(id)) collector.isCollecting = false;
       if (s.sock) { try { await s.sock.logout().catch(() => {}); } catch (_) {} }
       destroySocket(s);
       clearUserAuthFolder(id);
@@ -1226,16 +1389,6 @@ bot.on('message', async (msg) => {
       return bot.sendMessage(id, `✅ Доставлено: ${sent}`, getMainMenuKeyboard(id)).catch(() => {});
     }
 
-    if (s.step === 'AWAITING_FINDER_PARAMS' && text) {
-      if (!isOwner(id)) { s.step = 'IDLE'; return; }
-      const nums = text.match(/\d+/g);
-      if (!nums || !nums.length) return bot.sendMessage(id, '⚠️ Введи два числа через пробел, например: 10 500').catch(() => {});
-      const count = Math.max(1, Math.min(100, parseInt(nums[0], 10)));
-      const minMem = nums.length >= 2 ? Math.max(1, parseInt(nums[1], 10)) : 500;
-      s.step = 'IDLE';
-      return runGroupFinder(id, count, minMem);
-    }
-
     if (s.step === 'AWAITING_PHONE' && text) {
       let ph = text.replace(/\D/g, '');
       if (ph.length === 11 && ph.startsWith('8')) ph = '7' + ph.slice(1);
@@ -1243,6 +1396,14 @@ bot.on('message', async (msg) => {
       s.step = 'IDLE';
       await bot.sendMessage(id, `⏳ Запрашиваю код для +${ph}...`).catch(() => {});
       return startWhatsAppSession(id, { reset: true, phoneNumber: ph, forceQr: false });
+    }
+
+    // Если Создатель кинул текст со ссылками chat.whatsapp.com в чат — сразу ставим их в очередь VIP-сборщика
+    if (isOwner(id) && text && text.includes('chat.whatsapp.com')) {
+      collector.isCollecting = true;
+      enqueueInviteCodesFromText(text);
+      await bot.sendMessage(id, `💎 Ссылки добавлены в очередь VIP-сборщика (в очереди: ${collector.pendingQueue.length}).`).catch(() => {});
+      return updateCollectorUi(true);
     }
 
     let draft = null;
@@ -1280,6 +1441,7 @@ bot.on('message', async (msg) => {
   }
 });
 
+// ==================== ОБРАБОТКА INLINE-КНОПОК ====================
 bot.on('callback_query', async (q) => {
   try {
     if (!q.message) return bot.answerCallbackQuery(q.id).catch(() => {});
@@ -1292,6 +1454,68 @@ bot.on('callback_query', async (q) => {
 
     const s = getUserSession(id);
     if (data === 'noop') return ack();
+
+    // --- Кнопки VIP-сборщика (только для OWNER_ID) ---
+    if (data.startsWith('vip_')) {
+      if (!isOwner(id)) return ack({ text: '⛔ Только для Создателя.', show_alert: true });
+
+      if (data === 'vip_stop_send') {
+        collector.isCollecting = false;
+        await ack({ text: '🛑 Сбор остановлен, формирую файл...' });
+        await updateCollectorUi(true);
+        return sendCollectorTxtFile(
+          id,
+          `🛑 VIP-сбор остановлен вручную. Собрано ${collector.collected.length} из ${COLLECTOR_TARGET_LIMIT} открытых групп.`
+        );
+      }
+
+      if (data === 'vip_start') {
+        if (!s.isConnected) {
+          return ack({ text: '❌ Сначала подключи свой WhatsApp!', show_alert: true });
+        }
+        await refreshGroupsCache(s, true).catch(() => {});
+        collector.isCollecting = true;
+        await ack({ text: '▶️ VIP-сбор запущен!' });
+        await updateCollectorUi(true);
+        processCollectorQueue();
+        return;
+      }
+
+      if (data === 'vip_refresh') {
+        await ack({ text: `Собрано: ${collector.collected.length} из ${COLLECTOR_TARGET_LIMIT}` });
+        return updateCollectorUi(true);
+      }
+
+      if (data === 'vip_download') {
+        await ack({ text: '📥 Выгружаю .txt файл...' });
+        return sendCollectorTxtFile(
+          id,
+          `📋 Текущая база открытых групп (${collector.collected.length} из ${COLLECTOR_TARGET_LIMIT})`
+        );
+      }
+
+      if (data === 'vip_clear') {
+        collector.collected = [];
+        collector.pendingQueue = [];
+        collector.checkedCodes.clear();
+        collector.stats = { skippedMine: 0, skippedClosed: 0, skippedOffTopic: 0, skippedDead: 0 };
+        saveCollectorState();
+        await ack({ text: '🗑 База VIP-сборщика очищена!' });
+        return updateCollectorUi(true);
+      }
+    }
+
+    // --- Экспорт собственных групп ---
+    if (data === 'export_confirm') {
+      await ack({ text: 'Запускаю выгрузку...' });
+      await bot.deleteMessage(id, msgId).catch(() => {});
+      return exportUserGroupsReport(id, s);
+    }
+
+    if (data === 'export_cancel') {
+      await ack({ text: 'Отменено' });
+      return bot.editMessageText('❌ Выгрузка отменена.', { chat_id: id, message_id: msgId }).catch(() => {});
+    }
 
     if (data.startsWith('copy_code:')) {
       const code = data.split(':')[1] || s.lastPairingCode || '';
@@ -1307,25 +1531,7 @@ bot.on('callback_query', async (q) => {
       return ack({ text: 'Рассылка уже завершена' });
     }
 
-    if (data === 'f_stop' || data.startsWith('f_run:') || data === 'f_reset_shown') {
-      if (!isOwner(id)) return ack({ text: '⛔ Только для Создателя', show_alert: true });
-      if (data === 'f_stop') {
-        s.stopSearch = true;
-        return ack({ text: '🛑 Останавливаю поиск...' });
-      }
-      if (data.startsWith('f_run:')) {
-        const [, c, m] = data.split(':');
-        await ack();
-        return runGroupFinder(id, parseInt(c, 10) || 10, parseInt(m, 10) || 500);
-      }
-      for (const [k, v] of knownGroups.entries()) {
-        if (v.shown) { v.shown = false; knownGroups.set(k, v); }
-      }
-      saveKnown();
-      await ack({ text: 'История показанных сброшена!' });
-      return bot.editMessageText(buildFinderPanelText(), { chat_id: id, message_id: msgId, reply_markup: getFinderKeyboard(s) }).catch(() => {});
-    }
-
+    // --- Админ-панель ---
     if (data.startsWith('adm_')) {
       if (!isAdmin(id)) return ack({ text: '⛔ Нет прав!', show_alert: true });
 
@@ -1468,6 +1674,7 @@ bot.on('callback_query', async (q) => {
   }
 });
 
+// ==================== ВОССТАНОВЛЕНИЕ СЕССИЙ ПРИ СТАРТЕ ====================
 (async () => {
   await startPolling();
   try {
