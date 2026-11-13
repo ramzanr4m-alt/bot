@@ -1,3 +1,6 @@
+// language: JavaScript, file: index.js, runtime: Node.js, target: Render / Telegram-WhatsApp Broadcaster
+'use strict';
+
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const baileys = require('@whiskeysockets/baileys');
@@ -9,160 +12,66 @@ const https = require('https');
 const http = require('http');
 
 const makeWASocket = baileys.default?.default || baileys.default || baileys;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, Browsers, delay } = baileys;
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, Browsers } = baileys;
 
 const PORT = process.env.PORT || 3000;
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '9069645701:AAFl6LJQxT4bA1hRLDowJLigUbeIhJR1YcA';
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+if (!TELEGRAM_TOKEN) {
+  console.error('Не задана переменная окружения TELEGRAM_TOKEN. Задай токен бота и перезапусти.');
+  process.exit(1);
+}
+
 const OWNER_ID = 5846687574;
 const SUB_ADMINS = new Set([8264531154]);
 const MAX_USERS = 25;
 const PAGE_SIZE = 10;
+const ADMIN_PAGE_SIZE = 6;
 const BROADCAST_DELAY_MS = 18000;
 const SCAN_DELAY_MS = 200;
+const TG_FILE_LIMIT = 20 * 1024 * 1024;
 
 const logger = pino({ level: 'silent' });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isOwner = (id) => Number(id) === OWNER_ID;
 const isSubAdmin = (id) => SUB_ADMINS.has(Number(id));
 const isAdmin = (id) => isOwner(id) || (isSubAdmin(id) && !bannedUsers.has(Number(id)));
 
-const RAW_INVITE_CODES = `
-B6kliMPOycnKSanjaztmJM B7ryAy4mCUuCuVlqBA6bNp B7tvHQ5BdrKDMAASoZxETp B7W5gpUVLxqFwZYuMlAiAA B8gvhQGOP19GygmaTEHPf3 B9hZvdsOI30KOhpGE8RSdz B9TTnIDTM1d4o9yE9zx40z B9zqDXlxQBaBIfKPZT8AH4 BaBdMx1PTfTF9gKAKnVlRF Bb6Cp3Hdkhv864U30Q63jp
-BBKGY5iAnj6DTOiGrkEgL2 BbxUXeuHdzPASPqRBrXKk2 BC4DGnJhmza3kO7zopw4sV BCeZH4wAHQ8JvR6dh9kUZC Bcm23XDWyCf978GZvIiZhk BcMiFwgzGaa0rRl5jczmrb Bcn4KgTn0szIt5L11isnv1 BCWd3In9Kta2iZ2SUXE0NY BDlAXZ91VoI7rfLGZwHlAh Bdo6i0NOIeWJTiJNGDIK2w
-BdT1S0yjSNy0lLzVUL1qc7 BDWvpnF092t3EYEEb4UsAY BdZRvlaNw5k0zpx8LVDxYw Be2117VrI30EKV8WyJmZm4 BegysqnDLnh8uzW7u538R3 BeluxvZBml2HC31MaMPVdr BEpsqEzuAScIqRgrNbKiEo Bf1ucqUAqxzHAv28J498ck BFiY7OYeiAsIsYFQIeCxUh BgAAdRzZZIv0KaGb0NRMBW
-BgabBMBi2LL8H6Q95BMzMG BGd4p57UP3x1kIm614qamd BGjB4NswiIs6Egd6ULwZnm Bh9xCccHXSh5oCSc90oaTt BhrCdpQmKcf5jEst7qJzLO BHVv94eha687QNXfOXPYM7 BIh0H8NNYm0549Zpnzu2iq BiH99IhbNYKKizyvnGCmyp BIP1IMlaKNv2xMV7K2k6GW BJ5vmyeGc47A6Pz32qrd7y
-BKIOHHqYbYR3ji7VLvKoVJ Bl7IpcWAc9r0qtJgcLXXbk BLBbBouOviT5TV22HX6VNR Bm5Vw0bS0yG47iRLzXNipl BmliqObFpEy0eG8IunQsv6 BMxUvIc9pnx90ZXUis0s5v BNu4SS1Uor7DhFcTcoFESU Bo0uO5pUpzdA8aIOZ23TTi BoMLm7gY9m3AUp0Xc4mRcF BoqYagxgjnP0ETclMQu0Pp
-BOrmWMwKjDOIj18am8KB5A BovzF3QWrmV67sHueWqCMO BP3FzOA1DbFEnDgIVRRMzI Bp5h6yYzypnKOYjyJxpcxh BpaXTRs7k2t36ZRAmlxlLy BPiQNSBNvIQ2rTQY1qq5oi BpVvSG9IYr3DWQz72LUXc8 Bq7irXgEADcDQTrO6YkGIT BqERqZRmPcXJnUn8JhaA9L BQJfeyHUWgD1Vk667I7WZd
-BRarXr2C6mHKmgpIJ3f9jV BRCmBUeiJ9mF6aUvxpiq7A BRCyEDyAgjIE7wSWlAt3Xs BrPiGsQZZQdIScJMEjlHIu BRPNh8FT7RXLjCIYFviKC0 BrQZ2Roz9CR7G50OqdcY0c BRSsInefAMa058HRgZ2DqH BSiEXa1S6r9Ayd5Q2amzeB BTAUaApdPXnIwJ9xd4XfCm BTDryxdiqcE1qgu3FlsW08
-BtOCvkezuLqFppXJDv2XW0 BTxBvk2kU777XU2DzOXGt8 BTyL11FIvOGFmDj78F4wI9 BUDOuQm4YMMHfexkTYqhzV BuFOkd2Diuu9vUAilaPPBz BUvOJMau6UUBW4eAuYDQqw BuWwj71dmv22QmGqUdZOcM BViXgcOVNZNEYBkMPBEuqo Bvv0S8TlrzvAMt5OEBNf83 BvXrspWfRMjLaIlXFh5ie2
-BvzfzIehtlk1YDfTBlTdAh Bw5duhUQKd4Hx9m1MaFsWU BwbGcNfbcNR52l6VdCAoIB BWBZsU71QMjC6liLp3e6N4 BWDHRA4E2dGBSR8UBood0l BwdjCvSbBnJGH8axLfDbFD BWJPCB0aiXrLVp411dSc0I BWZCOXyHvVZ6ySLBmXSodB Bx2A6122MhXFxFglIYHdqU Bx4yOzYjqPAF9mQWX6enGw
-BXIolbUhrrhF5gycpZbqMu BxjL8kwxkYTEbTHwaHw2ab BXKXNNwWvL7J3uFBM3NX9e BXLnQRk7Tdq2eOTI2bZSfq BXwZgaqhx2z3h7qUSXkKya ByNwcjnut4OER502fdLY5Z BYRQJRjj0YQ8oziVAFFFhd ByS7017vzS2FggUIiXfXIQ BYx9UTwrO8G7GZ8BRD33hr BZ2vVRBLb0x3qlISXRgIPo
-BZ46TLv4UJk0NJbXUXqfFt Bz7DLe00cHB482OxUF15K8 BZAfJcxIEjzLxAPXDXr4VM BZcgrAfIePpHSx58CkthuJ Bzej0pordym5QpamS0rHuP BZOpJsJJETSIO6WUB4o71B BZVE2Hcf44x9LXfKC9wrYp BzxPiryCtox1HMhnTUYr6w C0Fp8lOZjvOFSeNx3MnTL0 C0pD9Qxfnty5VX4oBJ8r9P
-C1fik2TY6qbBiVEDE1aP2E C1r8hAtAZOe244mdEqHag3 C24iLTKs3s7B60CGr1CAbQ C2LxSvCjOulI4Ov6GtwexS C2wM5G4XQmpFKkJKyok7dm C3qixPXgdLOFc14el8B0IE C47ly9VUS6XLkb5ACw66oU C4CUxd1I5tH7Kt5fO5sHiv C5Ghjx4Jps7COSrQuKvMqU C77eiCcJSncFZRfJLzPnLf
-C8I30coTeWZ6hyLlaQhSp5 C8Iw26N5ZUz4gGM1FsAnwA C8j4MxjQEEr37QaMzL2K5H C9R9b12Nzck4taRzr2pJPT CAF2uFNTLlo588zg74iC27 CaH0E8ZtC2o11kyoi1YnoV CahtcDxaVm4E65haMeZuGS Camtku2XCVwJlCMIlGzlgd CbfHJvQf0hu41dWJn43KKo CBn7SvTIfEk4aDlPHQl5vZ
-Cbvfj7AovyxE0LfKZvRuWC CCagFtvyyKuLjjYz1tJkPp CCm6KyQvPbc9P8tUxjB1Z9 CCstROw20TX8haC6LQpQbd Ccz9XunVqvNE7ZiozHUQcu CD5toJyMtyODXZGNLuXPgj CDTsPt925XdBpO5Dk5B1Wq CdZWhKWFyoIHrRG4Dewuc9 CEJQe7ivr025HcQCQwu1V1 CEOpiSUmhSlFBQuCkyMDgL
-CFCgheB0B91HhwaCOPBLwB CFMdJLPrZSYJOaIzE1LzB1 CFoQwA9JfN1Ax9TEmJwYWs CFtcyDA0cgfAfFORY0OGym Cg6ElsEoaGG2RYXixgXYyp CgaGxrLvKnfFVIn5apA1ak CgECE2peKPZEGj0I6LIfQT CHjqsFMO9nY4UP37od2CZ5 ChtKIw0sfLfAQjquVI6sHH CI0EG8loojyESAYlG9ZqME
-CI30Ai6a7HTLY07Zoy6kIV CId1D88XbIL2nnx1L06QWR Cid2OowGfPHDSBdQP3JLSj CIhJSo9DxS6DLGgyjE4Avy CiZAq7CKWqrIl9ikUN8Llk Cj1mzvU2BTMH8WkpslIPQv CJFY9y7LhJV8i07VTvJ3Aj CJhNwFL8LRS50ZnltWH6Qb CjUCe3LbOsDBnrJHWVVW8Q CjWdOFL6akhJuAcNdHeubn
-Ck4hBYOAnuJGl1Gl9G6EZD CK58rXzFxbU6aCi130wSEB ClaIWBim50pBQF11L6VpRm CMGRTsHrYRZ7hFeaRz2QDp CmLCVUQCnOpEHDDCEUSVjj CmoF42i3gPvBlaI5xq9y9M Cn0OBSin6dyIWaT71zfxaY CN1OwO8xFBQ6kWWigwuYjv CnJB75BeNbVHH94kD4UgIj CO2fLf36RndKpAtLJHpROf
-Co8YrGEUq69F0bn7bR41hu CORrUZtRJJTGMPKiy1TXyY CoxQKvHA8lJ4Raaw7XCWmg CoyPIRSHPghESBcg6ZYIg5 CPA0BX9Jlr7FJrHttJCfb2 CQbXEbvVJ8N7CXOHiglSTx CqJCfI5QheM5QaIof7cIZb CQLFbX0Af0w87jwA1Cp3Gn CQvNFpKb4KL7UB6dfaNyIG CqXCZUXlHjp4K136MxsWAD
-CqyxDSHk5xX3xqrOEH85iP Cr0hvLC3x3LEkhCUOroeuk CRfVAflwDu6BwiegnIcx3K CRTWDe3ygmCDt2gDjfEwOk CRYAv8XAd9d3aGmtSbcEbD Cs12ChIaEHWFDNO7g5kIfQ Cs6HXu2HbUxKWkaROk4F2L CSIbfZLBOT14J4VljOw0u7 CSQwOuUuZ4WGRDJaInEKk5 CSzPSu2oOGTLR8303kPPdN
-CT21MwLRIJu4PCc7qwXZoJ CtVvjbocjid1qbV90y82CM CtzFVuj62JCJP3Mr67xRaH Cu0k7LcvLlJ3kp7ALtsF0N Cu9Kv8KWEYHH19bmvRONiL CufLkm2x3WtBnx7vrBJDVD CuS5IIRShMf0cDpZApNwqi CV8m3zRvO3n2kMJu0wu5yj CVEn7jNGOT236SSoikVic6 CVpJdPkPnqHB5KIOc0O6k8
-CvyE83EZazKAtrPwGFzJJN CwxqdqMCKEiAp2Fh5KZwFx CxaQDCMrSgy01Uu7zLXkkh CxmpR28ZfqwC5GbknVzvIS CXtOI2KYw16KbWwAIdijgZ CxWdD34Q1ML1PbtuTZbuox Cy7qCiBQva049QWY2NggAY CzLt1lCGpkW9zGr9JD77Xk CZQEWU7UVan36cPcc4yU0n CZuUhBzpdfaD1Ona4mTVIe
-CzYGMbqbV9lI6cNsCEfNXC D077oIb0Sd3CLwZnebzuL4 D0h3fdLJwqT1MRFcchkJon D1pQPGSUT0VDV9AJy9H9ZX D1wj6soPWDfDM8eBsc8e8q D2MYnCqSLGc2y0NdP5dwaT D3E2Y47dfoMIuG7CpY2SPA D3QlpEcnoL9Jf5SnduWncT D4Ap8vcGkv63I6hjW6ru1g D5RwEgVd595Db2RPmmICps
-D5ZkRQgr5snCKC3ACUmH4V D7HnOoDfj8y0cu9pRKtjfP D8b2OyuAyKBBNa9UhNiYfg D8o3CvzQzBD39ZJiopP3V8 D9OjjHnWKby29eSGV5bBhI D9YnI3oXF7j40M1vlcWqHD DAeldwzk1DtDNqRrC7hYwV DaPV2l3gXhnBd1ORp8R3eV DArkBVAoztFHaRHGfYcjSL DAztKOXuRSu5ONUWoNjPfN
-DbCzFz3av30AwGgIZ9Bnyw DBFjoxmXzPm3pghf3SpEHt DbTODkZzPaw5VgPyHbzsAD DC4tAHyYyngKjngod6bSAS DC5ieGAoqJoLG8aLFb4Gi1 DC9L10QDKJP5sCNXoMHyst DcLi6hjONcKKSQodfekgM1 DcU5WMmBlhi0phcx7Mqwc4 DcXM56zRZ1o1d3E5n80N52 DD0h1YYVLZqFlz4RCnWObo
-DDdsjyN3Qrw1VzHnLIbH3R DdqBY4A8Yb15A9YYqY7Mfu DDTDTQhlyOV54qsQm97BNU DDyqdAGFTl9Gbw0Y6N45Kd DeR3SyWA4jO2AK3BBRSepI DEZlpx66Og1FE32x8MMimG Df3AysqfJC12gjsHuXQtrW DF5bznkjQv3JUZK9Iq9X5E DfIRgvFJ0IiKXRuHZGPvAi DfwRZ2CY61J35R4dJexqTC
-DG2yM9an5g228lWGm9doB1 DG4SIDahW5pAm2cUwQyOF5 DGbifGjvEUmEUbLTvjocws Dge3EByIAQSC3rRaeR0XKH DGJnYoqySHPLuRkZA48V15 Dh5eUeC5JSBGiFLR7CogBn DHbEaaDwYz138nxdrHtRiC DHBucbjpIviJpFVXf9Pk73 DhtmC41M8ySJymmgpEQr70 DHy64QroTSR3yDV1V36r3F
-Di7L3owCdc9JPqpERxqrFD DIctlIXyz2t8f12zCM1Dti DiPHhoyHg8aC04RiuLCKr2 Divq72XNL8t5iZpHfgE9cN DIxAiDd1O6f2M08TOpoG5W DjCPOnoSkvg70tSgNwjpkp DJCvAEx2W21E9DXykQwu8B DjUxWym06hXJTffAB8e8V1 DK7TZSfJ2bG9iqr0a45f5y DKBtxNReuEd0a7hgJr2bAK
-DkC9buuYezLLS25qhjYOEL DKJGVj3pUsyJu0suh9UmwN Dknm6BK7d3BDZyd31yVW6n DKwLmwtdUoC2OI8wPz2h0W DM077wQ1LX4Gz5SwvaVjuz DM6IvXL1bygCZ8nLlwIWVD Dn9Js8F0g91Empqhxt0OYV DnNgymm8ca83XGf3ScGsUJ DnwUmSPKBTR6HOvMawLaIW DnzHWGGU19v1yeJ7vTCbXh
-DOOImlQEWR9Iqsxq0JXnsg DoTaAKTguw41KtnBby3SSJ DoxYhPINTg6AzPwcrAouiP DpeCHf096ezLXtza8h3FQZ DPWksVTZ42NJZl6wQhWrfV DqHa9kdxvcE2xb53J311Cu Dqj8fFaSHbrIZcRORPZJ3y DqMpTw472tlAjD4sXkumbi DRaZznyQ7QwIt6OhfHNQN2 DrJ2Ec3PITs6iNiObxYzJ1
-DRKmyLQHMK4KZ3GOFOVpT4 DSGhOXRyYf8AthpkJSnx5s DTGGU8w5rIlLgG6HPdgp0t DtJ6LAv3CsKIqHicJnxM2v DtJm3zibmCi1E5bbXMknF7 DTKOiGiJVHHAjZZltjHOkM DTNcGTLAJG4FUgKJo3RDQC DTYoFzXcDbe0URko33UoS7 DU0I0QQB72fHySz1oi2iin DUB3KmCRdNVGruxpaKi8Wy
-DUKwMUcSw2AEBlb0Ejc9DN Dwb124qqI0tJZ7lvQ95xWJ DWc4h5B9TP3ICIWHXqwEue DxFMqxrTOtOAS8Xlws519G DxOAF9mt0onDgkDqHiQZKe Dxt4f7Q1rZn14CFuQTt2Zs DxW0ilO3FMkAw83iyIzMRZ DyAKV6m809m4tm3zAuqFJF Dz10giyfb0Y8fP4sGefamR Dz9CePagAO6G5ouPEJRAxr
-DZuk9XIvyUA7o2Dyjhdz1W Dzx9yIBY4ziDpqNvjY1wA1 E0cS0HvQQVsKVMRdRKXEUO E16iyzGcY8p0iq7YBuOCBE E2cOzsqgU2aHxzbd6U9Tgr E4aTOTyQDCoBT4MKV9n96l E4Kqk57BcIHH4n3dbhaQuG E4YU5SReoDrA7RbWzyN8Rf E6EOHsOlA6F28RsM1tiTta E6l1a0jkboxGaAdTAVjitF
-E6QMf8Cf1AVDrwBuJs0Lp2 E7eFjYB3OaIEVruskAPFgZ E7TbwwPpvTb8yqfZFmdp5V E8ey3ZqUPm6BuT1JZCBvon E8lgFlz09ue4MJPjeBP3wV E8RQMM2Xk5b4yHJHmkPVZn EaekKKKTRdmKwEV1IRTB3c EAvJsSOpdowCzFBXgjF2VY EAVnO2pksB1L5aTXUWooFi EB7jsL7pRI6JKoteuEM2k2
-EbcUrMqOqW72yNBFJj2wBj EBIxiWmOeVj0xmalryFF2Q EBnqMceyj44LF3ze1OLuvF EBXUmqOZkbA90tp4as0bak EBybDZw5tUREfBPitGLGDD ECCotMgHiFVHbUf0YRIQG9 ECZQ0TbZci7Ftc2ovDtMrv EDeJ9tP9vjpDDfDVGndg07 EDGu04pUSTEGaH9WSB8CGt EDMwOp2dv69Hvd8tuPNUzS
-EDPw4UbzA6eAivNqx8H5KZ EE53gSk9SYD5LkO6GtoBnv EeEOsJldFqoJ75ew7zQy2j EEOq5lTKtUtEvCRybS4Vsu EETkUau4PGD8H1BEyeOT1P Ef3qhWooAJkDzO5OP5dZx3 EgJY2Mc3xGWFqqh9LUPIk5 EGuGBMzynk5Ij0bHzqjIGC EhFQXTEsTYM8FNtbGdWegY EHL0m5DLlXpIkksc4lA2Kb
-EHl3P7yZtdiICjwqaL9Apb EHyjNHp2XlMH4GmTznrzNE EiDgoIS31jrKJaxpdoouWw EiDZJ8ryhbZEMYA4LqggyA EIsaVj891QS7skcDphq9uZ EJ5flywtFze9vHjnctYzDH EJWaZnAyZkP7d1F078p3ai Ek2yIASbrQdCJ7y9Akf26n EK4bdn2tLTqGTDAXHDmHEQ Ek7FKfGutrq9FCfeb7wtVl
-EK8kRs6RoMWDI85uh4Rd9X ELaqKHCAVe20U7Bsu1mauc ELsl0gizLFsDRkpPdwbwwI Em0KLq9OLJY1QYTPFUUoiO EM560Umvco03RlvLlWuQZo EM8as0hkzTmJzWz0Hlrz3d EmAfYHe9WAF7ebvo6ufDYO EmaM6janvTvEQHfcbGdfYX EMCs9oiUmEBA113GM9m9VR EmfgJAwHEu5EpW1v9ZwQcp
-EmOpF07WkbJHHtjRePUL75 EmyauNW6fFnK0i2gGvlCSo EN4al6Kp56NAvDIzCPhyUO EO102i6y5AYFm6qMASlu2Z EoH8qjTqbHi0bdoBcEgfZX EOns30KEOk56lH9DgZ7J8I EotbDVEPkz9A1C0QMvKumr EOw3VJDhVzcAf51qSD17Ql EPu8GdU16pO2jEwJY7Eu1q EPVbjMQDfvD0LjaQXhNHQO
-EpzuGyRBSZL7aouFAlaNg0 EqdL5U6XEOHHIS9NVqob9U EQNpEiKqLjn391jzwQZSYn ERAmBvVwcZ5161HchmsCWS ERaZi8kkdrV7C4xM5NejcI ErBKAdl3NSULRrC6QIwNFm ErHt6Z2cVvfGVwPkbC0mct ERSFLalGOZ3Hz8lw1vq3d3 ERtNe8Ykpwy5yPVQOh6OgX EsGxsBtpi9w92jUQhpagfC
-EshSlntkgi8IbYVCIBokcE ESO3Z0FPo7s31N6eCpJzTr EsThSrfiJfdHTEnJ74EGZz ESxiIxYvTYB6RCkvmCKI1o EtTR3zNXsCmGNAWj1bdWXo EUebzvhQTDsBWEPXMtO3I5 EuHRLYaOYuC7jgvWv9CvDO EuT6Koym06M3tsmw0mfW3n EuTUVB5BP5KIR0SLODt4Uj EuW9RhumHwsDkGjGfwrBpp
-EvjJdeRlanLK8lYylrZ5gO EvoPpIVrnXL1iNnweel97x EVPdwoXREOJ76O3bvgtB84 EVVkYjTixfB7P9X09xP0lt EW4FaWxcOiwDpaoD8oGt6M EWbBZ2qM0OXAEcRROVq8Wu EwcHfY7j4o15lrCNYaOzZ7 EwEs57jqrsVIPeiHCA9ksS EWjwu7hcomi26bvvafmuw9 Ex6whpfk0FOJ3n50esth17
-Ex8agKi81tZ9Ct4zWUeDWB EXaUrJnbDsNA18TLdDJXAJ ExCAjmDRkOG8ZdldruwHFO ExcZeoa0GOC2ZsHHuTY545 Exd1HO79N3R5aHmVaHr6Ui EXEMXZPwoInLE2d2Zh2fHo Exh9dN85PHV84IMrOoXmWt EXxjcqJ4eNJBlWyUfvTFLp EytjTiF46S345gikDz359w EYy8wqTMFrE0KzCHunFVWH
-EzCggUWMcJqA4E57mPEmFa EzGQ25Gkjxl18ocSi4FXZc EZiw8yYEBhGDUoIruKb3md EzwpUYilUN3HMeQHYalmJa F0JtUPonCxK3tzqTxaq0aP F0KAEwdEcR7C20XMyJXIBe F0SCGqYJsKGAv6aMH1Tjhq F1C20hSLAo98koBYIRdrQY F41DfFhx9uMCh0NbBPouih F4aamFl84DbAbAotNTfUwZ
-F4Ez1dVsBKzGibjjDbUVRB F59QPpGOGiF3Kp3EjLzpL3 F5pWqv0RdaE4ASQvrhAQR5 F7AOhpV3Qf0AAr4xWeszBn F8lBQiL8VjgHFoDiIZuvsA F9Q1RlF7vwgLTgxeB7o1ui FaHPk0FLG1LJiCe1wgf4TV FAywdv1bk2d3TDmqUUzE0U Fb6KiigdFAoE4zyphVaG4c FBLjcDGLYsJ2pfVEMSrH0I
-FblKvAVAMWJKKanydxykdI FCi9Cze5x92KrQsV0mZaik FCjomZJxArzEwCgofCCI11 FcPZNNs7IazFOJ2KE5Scid FCVM2LLThMJ95fpr6vjvTT Fd7Pc7jzdSKGmdERzHHjvi FdD6IX5yfHrADrS8TaL3op FDghgOcSfI6C0lxIJLMuBf FDwl6tWepMJ0CQ0tmTct8k FeewzSfQmhMIDfTHUc4Hgt
-Fei1e6R4z6QKGjQFJlC0Q9 FeuMgpEdliA2AYTV0yhSc6 FEXq6gIB9bd3n1QXkNGVuK FG0MO4cIBvAIkTtI78Mu8N Fg34bSsRdljIynhXiBL7C6 FgH7zZ0elF98DorG8OpgvH FGi2Dxf95p7LNexMCWcsir FHA04ypdAdNCl4dM2sNhrb FhQVt90jLowBou4EujYOSO FJ86f4NJYVSH83gh17KPCs
-FjCxu46o7KC7U0sVSRv0mX Fjj2RSAKBIHJmqeHVv8H7Y FJkSAlkyOJh4jifab8SOy5 FJRwUIfshSD0BNGLMpSOJx FJTtAFHLmbUCgei6lWBHdj FJYtiUGaswbJw1d6u3FKd0 FJzufiJRlW8D0i7jIiSn1x FK9CicPV6fwIVD7idEb37Q FKg7ItFyACK4FcrzVeLHcq Fl3W6AC2k4LLahmEzX7jYA
-FlMhkB6MgCF5x3gstxfHKR FLRh3ijWzzn7qNFL8y22I0 FMfLWG5e2801UV2wEV6aH7 FmfUuXy0iWD0lmWmuHWHy7 FmwR4PqrPNoDkOR1dIP9Km Fn5UUZfLdcy6LExGVat2Qu FNv3vEEnxXP8O73vkA7XGs FoAHwpRuInXENDxceaCJIm FODiazrOrru0NdV0NzGf3H FoJjj2GrX7fKam8aBiyjS9
-FORCrjGfPZY38DVIAUYRET FpeBXAA4bEzIHGVjzYL1ji Fr39ihE0HZb4adUs8m8D1u FSdVuwkMVZSBSAcFTtDHoO FTcHJ3OZUCU0o6sy6MqdR7 FTufWQzbL8BDehUs6IjU3r Fu9Y39mRCar5VET76NRzL1 FU9ZqUqhU3ZBZfiBhp2R0g FudyRDIjywPLZSQ5Jp4tRe FuYwc6XfCx41pi1jnNbZyQ
-FV5XQoHOpM5IprXX99UEv1 FvpMjrc4Bbr65mXM8gmuv2 FVzCRWVXNMG5Kvv7zcnpBH FW2O3saCn3G6b8bj3iys4A Fwi92Ac9VXMGU7iLArMTVy FWik1T1KInrGpDTLaHQglJ Fwr57YO8WE75yStJrhdcoS FX4w9qc4SS55FR5XoO8UKo Fx62AJdFGexCMGgclKYbJQ FX6uLUMgWnY3ZzOjIuUHA9
-Fx7tF9HbfjG6SNYFcPT0DQ Fx9Ik1g7lBUCCQFx12sQNv FxaGqJIiIMVAbsdEvqoUh0 FxJZqtbSLUpKl8CDHwIoWN FY5367i2NT506diZft0FfW FYhNsNxZ8RN57wgstfTTkT FyJXKDNT5PkDRvmyzdV0EO FytsRgNi66V7HdyD53qVaI Fz0iVG2nTbE4ljrQi5sOje FZ1qO66W5TUKk72FNcMnt9
-FZeC1Pv5mQy4Vyi1ii580K FZID51cYRESKiSa1vg0NYp FzJlCX2LteBLmu24iccJju FZtRaTUTUePKjELX89EtvD G0Ad9pPa8vL6wibisbTUit G0MGKbiFZLV5jOkxYZjJ9g G2GoFurelIjC6q4XYEx35W G2hlSE9bdahJ5jRSsMrZ8e G3nbOAFuUhk3mjxJCn9DEM G4HdFuvHkkyFm4ifxxZ3bJ
-G4v5BUSeUJm9u98l7lqN3r G6uRjDzcxkQEiAbtJvLcVp G7JM1o2od5q88v0pWYbSU5 G7RmbOv6OLPAQiAV5HViTt G7TGGkEdbljDDNOfbWbEQG G8uEFVCGIxhF0kuWQuy5Ue G9l1nCBnKe38YeGJbiZynq GA3ERVhfR7e3SC1g1wvSXT GaayWrXyOqh5lufa6FcuuR GAof2f1hfhv48cTfpzx9WG
-GBF4fenmFNV7Q5Cg7S1OaC GbLcjGsu1lW8bHrzgMzLAN GCKlTtNafTN4AthAXkmLKC GcO2bL0sT6OClDTbKyv6aB GcOGtsT6OlP8q5SMKKN5YW GcsaQ3l3PJxJ62J0JoJcof Gdg0q9PoDXU2X95ifWzRVn Gdk6BcaUFR2IqJvAOaqBoI GDlPfHUAwsvEOODH3CeY0S GDyxrEwC37T7WFxkrGzsQh
-Ge7Qqg0ZPlKBQjBCsmBDvt Ge8WZmkmihOItWmXXcUeDy GE9uQgBr52ZLbw0Op1YZtj Geied1YH8FD2QzcSNvxTwz GeKNq2PywW6GIxk4LmlIT0 GetMFyIyJ6d1CQIpVBF84q GEzII0E115BFsvhgnMdPy3 GfMtX8hZuZ5I20Uipj6CYU GFsj9BotmBF41sw91lCMlr GFZSVnqrF8d3sEyZVojN9o
-GG28F8GkMURGdKVt4JA22i GgJ7JGDOxYhGW9nrRAo5Zm GGPaF83ZVZAIV2bNBeUQqW GGUxaNL0cfsGbCTuzwGIjQ GGvBAWqtbs6HOBPACpVdXl GgwLXBex8uZ4LAMXB6GuyH Gh1ogCj0mFs45C4JWqfqnO Gh8V6iUkUzmDok0CPtqrOD GHcLQq9addHESkSpAFpXwF GHdpNc448doGcLgSzuEKNZ
-GHG2G2jKi136ernfmu2eQl GiFOIXovVKX0R6flbDSaB0 Gii3rFCxcV573Ufuc47gIm GiSt1ZRp0kz5AQDURL0TMU GkId1R139HhBEancdRJxO4 GkvdwXcmspVHRwAvxHcvmw GlkYpeL0LggB1QweoYnQUq GLncTMYMgaN2gsQPUN0lTo GmEhmxqZjX58flRao3pgyp GMMqGYJOJ7jEld4oahQhN5
-GnlpDnTxO9o7AQNjPJQIjt GNlXjD5vKTbHVFysGGqDU6 GNofAg9vf487rmlcFAxB7k Go16v2vaBUE7kwKeDTjlRP Go4V8SQxyiA9vAv8PDj79O GOfYaL1TnlwL9bWbEt4Mli Gp5GBXWlLmu1gOuBObwZ7n GpmWF6yNRBAEFcREUTQn5C Gpw0LRwLlfqHVxM9Izpnvt GQdu8S526JaBrnXyUTqSZj
-Gqi9wnUJDja1HgRXAGTznb GQIP0pzQgVoJnys6J1gnfS GrilsViuIzKE7DowmfAdBV GrpiwuTjQQQAApeXvJGv60 GsdkDk1u2y5ImFsBnRrBxo GsjGG7dJGhWE8VrYtscfoY GsXtKA2Bef77GzUSNzatvW GtjYDhdIlwP3KV5jKbid1T GtNpdwGPs0C9IVAx9b8FHK GTqlpvBRroC98cu3ZIYFxa
-GttKDLRtdJzB39swqmW7ui GTY99RuqXgTHPmNxSC81F6 GTZmvEgGLYF9hflRFdLR4S GU3I9XGsilw94YCF9oE3PD GU6ce4dCSyUGkGJ0sr5vrl GU6eu9QM1ab6bWU5AjQCbR GuA8rSpUD93HzPVW3AzoZQ GuGQBFTAdYPK5gzvoSqwjv GUJ2F4GDzJm0ZdghSOWP0F GUvOFwMS2jQDLDFvlgP18M
-GV5hclgTko24ElXwHU5xMz GVBfyZETR9rCDPJvf4zCyy GVhcluVY0ZD3fH69IWgEp3 GVIb7Hk4JkM7FlmBH7AHdQ GvvIHvFn5h532ETaa5fanh GVyM05KRQWF9L6duGwAXoR Gw Gw0OcNUnSpH3AQCyYT5clq GwcFRpeKbUZEiTQXFxQe3T GwlctUamt6BDI6C5TDFLNm
-GwQiDKVi1eKEmwjOPJKe43 GwrciUVNdW5HalJlXNvkbb GWteAP5qsnLHhbZv2luvrd GwznurFbP3wEUM2tmnDzAE GX1fobYSZOI3vCSlIjsjD7 GX2fA5GltXB7f8u2Yfr6eH GxkcZaTgI1F8sXFulnmmQh GxOPwk6a1a67X62wqqZcmG GXwgg4Jz9uk6HPtID8UvQC GYlcqUktTJC7MIJVOeWDem
-GYycTacgrdBB4jQrzCd3cs GYYn6wljgCeFv0XBkMK0Gw Gz82Arxv4TJIREMt7sDiUA GZjwYxcOPCkC28WbTJMVkF GZLsHOis57rDr2q22kLWUn H0EsuIVeVw70nYYcmtWlEr H0KiMp2qHta0pp8ZfgeGoM H18uVo2XyYS3joPgzLRA7i H1CGW9P7ZehEttmxuPpkVq H1cpUlKQ6SmLRigi8IPVOo
-H1E0Wg8zR0b8Rt8tGLij7L H1hz7WdQEYOBQmGkgnSx8C H1iZq1F5yqz1Ggl2myrpLR H1oRaJoStKJLyT47aEqf54 H1z8mR8bpM9EDXnmMCHtEC H2c5AxTQDDx3uTAoFeV0vl H2u2eslJa9N2GXDcN6NVTZ H3Gbbc4Kjw10VVz7ram2l1 H3pW9EtekHk7Kog5jY4qSw H3U4nURYDug5Zlu2JnwBtr
-H42bZaLgk5JKq5knFoRjwF H45fb5uXRTw9iAO95nx5pj H4ZwQlOrsOl0qjsdNeIoma H5ojWgsvM7K7sePDjkRmEc H68BFvxtHxWKp7BqziGGPI H8wrBDeD3g0Ib1PIuu5jjq H999sSoh2qLCaplPL6eTdc H9RkAj5vtJc0QdbA3CdW6f HagewUcFTPK9AMzg7fzoJk HAHJInaA7437ekWbtoBiKo
-HaZqzF90lEqDz8Odp6z574 HB5VyxOYlLbJ3Z9lGOMYBf HB9Wy9pFkqFCvvI5YX0Psz HbhPawwQN914aRx7U6n7eP HBkkombXqkQEQQLKXvZ2bo HC69MPes2Yb2nBNuwECjqD HcFGP7hN2sGGnGWKSXK9r4 HCnhqszanga5CQWdgODan2 HcQ3UvavZZJE2jvxbHV99L HCtPwjtUXJcEvCmJ3aZutq
-HCuQMjZKaDT0B7Y15LNJDZ HdJYDNqajIRJ03UKrt1N3y HdqATt5gBdKIolwcq90cg0 HDTxkchj1u4J3CdigqnScx HEKYr41lQEY1HEf5iHnI4y HELLw8UrM2fLheyrNsXHQ8 HF1PeeDkymQIrZVkpmgmpv Hf1zO9keNka3Z4FzolUi7U Hf8GSlojVK1DxOwwb2CobW HfFGhtyGSHsHOUzbEzOH5l
-HG9eTrAsOIXAwCa15NKuNp HGDS7KOdFx3JTtsX2f5OvI HGeyRqfuw7G8KVZRZZ0R3K HgWgIn4yKRcDnR85nnQ1cV Hgz9ggK7RVsDKOq91RYL7O HHpCeOvi2ah8j9oYjxqJZM Hhqb5vp3Y4tD5klYoGsIkZ HhrQipMpbAy2vZwP5Z5u2t HhybRa5Aqod7dLNVY0PQcF HI9f1ABc9Yz0pZ8gIe1hoY
-HIIu7OoHJX4A8mYrAIZ3zv HiQCqajIEyz19xnF7yzbng HiVuv7RNtP1L2T4LnAVXqy Hj8wUvAFazw5wAJjlz5BIY Hjk5Uj9IBbT7LMVSSP2gxw Hk4W9Nn5fCg1cy9Dxfeoot HK6SKkq0o2eKymYQMPHUbB HkBFyC6uDkRHjd1Xb3btf4 HKGG9s9GRZwKblN2Q54kKH HkqPN1ofMGZ36Hc2WXHC29
-HkRWUj4RhMxEj9xljlglzP Hl8qDBpZfDGBLTR14CCwG0 HlA4z9ELP6j8DvJf3tZamM HMBLVBWZSjx4z3TyemaXBR Hmdb7zbHD5iHNssxjtV0zX HmDyvG5qqmr2r1eWArbHtL HMgcCNM1nGrKg7qbI6u351 HmGQhUO5DZv7zotaSfGwX1 HmUnHfcwkhw8e5n87pMmzz HMyLPZvcLNnLvd45RevOWX
-Hn8NsTLZQSoCoM9Q0YLeQC HnHNUkKxHJo2ur0R1IbW9j HntfYEpjPYTF2QGgC5Oj8l HnU8u8v6h0X8MflAkHZM7r Hoa5PYqjdP4HYAGexP84L9 HPLqm3uQ7dSFujQHbULECo HPTBjdgVLcnIHBiyuWRS0L HpXlCoGXmaxFaohoBLUlRM Hq4UfPkquNe3hF7vDyJpkP Hq8wX8neDNC0iEqgaAtv0f
-HqhW0qEZ7M7GjxdFQZYWke HqMueEPNPKP1JRsRFxsbuA HRDwR1vpHwP3ulQKsSQDRc HRfh63kFTyD1g8cVaO4zUM Hrn2f7jKNtLKsnVXAiIqPh HsbP8a3H68T5kenlFCPwaa HsCEyLlsYp6INcZvaQRLaw Ht0oWufcuEY22N4O8OfTej HTALqyvVnpI2OlxCkXms7c HtjpvQtZ2eVCKpDreGAoWd
-HuaCtdfWAvk6ngyF32Pgdp HucoV7tSGBzA5vHriQm6H6 HUQDfRnCWoB2f74idVnXOK Huy1rJbbXjaJoBxDhtVaTi HVihh4cXyRpIxPzweHbeiI HvVQTc6XMi88ZsQEp5n97e HvZidiMCCMIC2Ym6DMatZn Hw5K0ZLtZis4T1Upl1d8nX Hw9vYgFfNd02OsJG9cwOrR HWRoQkz8B4uHubWidi5RgL
-HwuBGcqeimxKyku4eBpT1U HX3pRZHFKgALcHdTe38j6R HxO9G4hWou84W3oD3CwztI Hxor6NUn3H69JeMyOyLLrY HXPZzb6rFj7JbQtSbWTTEI HxQWdYnyfUHFW4o01V17fQ HXx76jrfgX6GsILNmViB1h HxxHo5kxDZyAWVmVPYGCg9 HYXSNuSDayT9M8wGXeU7a5 Hza4euJC0aD7B3ak6WiA1B
-HZkZo4YXd9cA6ksKw9RZcy HZLF8XbaaYmHXco59FnvTs HzYwYLefnLOIbRuxLC0zCH I0GBJlqaxB71vTyaON6iGR I13W1uitQ4ZEQxEeTXDPXF I1Fl8YhgJCrHsb2vIdtKZu I1m4iCv6ooV36nEtG0XTg7 I1nt17sjJ544MtjmmJRgL5 I2Y8mUihrMv55vGJqtpXgN I3ZeROotZ8pASy0liaengV
-I4BmHbYZFOnE0VFpXLYXYG I550QWJ5vam11u6qpraLrh I5Z7UvNmJ1fLPHLBnZ18zn I6tUzbtwkJt4GSUbyz1XSX I790kybs7bc49xIwQWdYHb I7KhwHklSMm9mQk5ccJiOT I98tlJzHLk6EkeyNGosJsa IAQPB4BrJ93FMy1C4qeh6u IaRaNnFwMb72gRxRLKcHP1 IAU1LDKNzfm2eGLFvSkXEp
-IBBQ5wZppg2EaDDO79WgLM IbcdoC0Eent4RPI4jZT8ip IbHZiJaDYtrCk3luaYsy2X Ibo6UwQsjaED8WVUfiyTZK IbOZglu2I4O0PotqhDK7qS IBZhlHsSOVp5NbPyQFn6Sz IbZUfBW6q0k2YyMV1uqw91 IC5nVPdaTkxDYZvr3jtwse ICfH7rvAjfp19VWqD77dkx ICIJvLPDyoE6WYwj3oYKBw
-IcjQD5A3vUEE6KcC1VSuxX IcL5aTvUNhR6y4QJTBwVFZ Idck9jK6FK23Hi2Ralyk0Z IDISfZgP5hRDCicxjgzrMW IdtmmpLcLr6BZIktOXzBA2 IDU7uTx5HVx72tS6FbAJEg IdwVnuoCtd99rEoT89KWiF IE5LZ7b0oTnKbRB04UbopG IEc2paPXuGu1DW8zwz6SDH IEmZQGAQGaS0OYU0Sy1U89
-IfHOP1At9Rj9Fok8dEVqf8 IfpC4e4me934oiqradipgh IGctHa36sqWI6svv0Pf1mA IGtKdt2W0zRF6dmxL4HAwv IHCrBo4SUH0Hpwho2cZNK4 Ii7jnz8oJMc32xBeHX9ViZ Iic7uMrwMYT23krZQzdIGF IIUI8NlYFP34TsnuAGaHxk IJ4yPt7gHvgAqcv4CFBqFJ IJk522dCOkuHB1QFeSXsYM
-IK5QwbqqvBUCv8rpw6W23h ILCNOLmkTMjIs8O3HYNFMJ IlY1eAJm8Dv8njzm3kJRsw INEMMiT48H6JYQ6eKRA8XA INHW3ylASn3EY0yS0cmVW3 INSMWOJKH2tJWgGTnHqglf INWoulZcP8qLP7Tx7IrOaW IOCDVhevMdA62sZNgNErWv IOlF42ZSObT14dF6Yg2zzn IOMFqvqdk30G67re3xG4h7
-IonaZTh7JahKRgqk2tPvjE Ipn7tpWpaAdA1XOflm5Sjl IPPFG2katCa70wFbS0zJAl IQD2ku27RAQFpG8nUA6sAo IqPwm8fqLjWJ9ndV11cW9c IR0J0DMj2npFicEYbGYdQ9 IR5rVFzp8Gn1DSvaCg9o3s IR7j4c6i47q1vRmfTOReCt IrjKDknakN70S4c3LB3M3j IrxiVxfbMCLB3mRxqrwfX5
-Is1nwArVkBkFkSIbTrWvk1 ISjD8xmmHp5CosaiYVOgxV ISJoJ8XgY7dAgLrTbNXcK0 Isl7iFUyyju5Yf2Jlh8XTY ITaH0W47wTh6ocHVReNzY3 ItB7YsSPIoDFnAiC7fUp5b ItDde1XEPDf8JSEcMyAKOj IU8QhQ4PBryHxI4PrUnMv3 IUhsBFcWgiH8RQULPKyeQI IuSjcArWbnyLaQrCBCF94m
-IutGfWysMstCTk1Kka59NC IV3TKgMf2znEwkpg1uRSkA IVPGYckmNf11vJpCI9uI2B IvvGXlbw7j5GE1psAbMfZ3 Iw1BjUIrWZC7WpOjRetHKP Iw7kzcFB2VKEGt4gZBMU1x IwdF4Mmuz7713DZuYonCYi Iwk1Yu1IOiuKPvNfUscWAl IWK6Z3NbtvgK2YADEbL6jO IWqB7lNWsIPJUAaHZ0EMNP
-IwSPdYifKZ86P9qXrztgvg IwTTWMzTk4W3gEsqGEH1Qz IXckn5uHHbk8z92VDHv8ei IxpHT9pDtc78SA23tJ9pGV IxpSRxhFGSOAL64QxE2u6U IYaKOrENK0SGUhc5i1X3H7 IYB8HTWzxcQEvh7PmCcskI IYJ6406xAodJn7HJGfsKeS Iz5lrr7R8Xh2on612Uyxx6 IZGEBav7w2uGzxxBk8aHiC
-J0Bnt2NKEbjKRj2cxfYtqL J0BSpgvz3IjKoND9jlKAfY J1NAEMe4jI2FK2aPnLLXwh J1RiMyI9JeGBiXwbojX14h J2fQluKfXm1EGgfsKoeRbr J34Og93R20Q8GKWrbYya4N J3M7siY1eYA2Mc349J5hkX J3vjAtEFJ1N2fz7EI0qInO J3XMk0fu0FTKxKWmMo6Fe4 J4DznZ7SnpKGw1qDjASv04
-J4klav9NAl57qL2P7F63qI J4mucDZwe42AaQ9k45RWsG J5CTf2C1gnbAKI8AxN12XQ J5IQ63tCGHa7Gth7marVuE J5O6uZqQ3tIGeocDiJtrN5 J6lqbiVqRDz5xFsIVOiHrv J6Pii7m5Cm68b5krZ955pi J7xkJBibJ1sLh57ywR5uhy J8gKwKLMADZ0VnWJmDcBFq J8r1P9OgQPq8X47VZseFwh
-J8yH3mmloV3JLDgZkYSCZS J9Dj2rSBjLa7SokOMoNqZ4 J9z6ortVLkp6iiUUQSVaPn JAbmJuMF6a5LX1hD4795ft JaFlzGw9DrvD15gLG3iqbl JaSGeCgTpVb7obnbzsz3DQ JasmHfxgnSv1PJpbEzAIQh Jb9Xkl15xRrKU9ZycjPGMK Jce3PQT74SkEFyZeDjQs4p JcmWCOPvg6IBYu5crJe07k
-Jcrco9pqQH8CpWX5DJHvq5 JCUf2GqZDfMI8LQwxZyfml JcYUvMl9Yx6Bo20SdrWzBU JD0mO5pSQvA2k7ltjD8eFX Jd5rau4dMgYF4dnUFoQA4Q JDibO5nJ4bb8j6TYOJhiuQ Je73X2KcvfIBggxrbhtIjP JeJMRUJmXCEG3rLKivPrMZ JeqJ2LZVffEJInjZkM2Ls1 JeyV7nNiY7hDJ6QcCX1DT7
-JFagpd6c2mlFJ8R2g0hxZI JfdNiRSiceV3eMIuNvUpUs JFfdXjRMs3SKcoJ1fjZEau JFJxNtjxURzLKU0nM1zvlb JfnyyGoPZI300Zaga7xHKJ JFrhiKbGMFKEWC6lacTvsZ JFZjI2utcIOEfYYd1XLAZ6 JGez4NbWe52BY0tjhqVkNn JgvuVpLOCRUDl9YbUoHjzk JhdfJ81iru33FDEBzUHtRk
-JHHUHk8vv2G4wBAp8L0XHn JhlpQrNba3zFW62rcoim7L JHnuvosGsWNAzsJBCW3Udu Ji8yUr7fUStLsiGm6esJ3C JiAqDyiZxbbAMp4BjY6tpn JiB0KfN0JDgCxmOPeKsqRH JIC4AEDBIVm0SSmsi2O1mp JILMS8HBpGCASgtbnciAST JiXVSbZEJTn95Bd6KeygNF JJlIU6ZXCePL3bCHAxwf0m
-JjYBIQqokyrGthN4FkacVR JKYVaPjf7F95JtBrvvkbHH Jl0cPywZybI1TtIjxZYGq2 JL6s33roEtYH8hjXb0kgG0 JlAvTELqttS5o9Pfj4hpdj JLfDKFAaLVg2U4KpnWXIJz JLG8afe0S3dL6PKIrvu2iZ JLKWj3jvfR0DwHr9Uq4Zjz JlUnXsaX9kn5KtBuKGAWYS JN9jdF9dNbM2P8jIWbwjXf
-JnCUY6De6Dg85CL4f2zHrr JO1fiKFVU1rB23DVOvOS6u Jo3klncLEfpBFcnoOFHeMe JO9qpqy6sBnF4N5rCsCpYM JOAsTTurk6GCy0iEWSELS7 JolFA4U0Ya3050UneRfelx JonIleb3fbI0F8uJzaE42k JPf86p8TxFJ7wzT2uwKJbY JPizLDMqKwZC8lgpnPG1Wv JpmMCJ5Dys9HqmsJw16JuA
-Jr59uuqb3e43a2syiSdBfN JR5whMuVUeX64ebfLbd6y2 JRMYgGjLKh8HBiWo9zsnua Js376DHz2mnGLmgAf57L5F JslD4xEZyL9Imq8ukg2ZZU JSsfPKrnhG11lK2DsT3rUq JT6dHJekQb2GKUNLEyhaAW JTAOcnM1ga4HNhgFDV8kq8 JtFIMQCmPD944qnjmNawTr Jtg3DLG8OgR68Ot17frniB
-JToISA3euN6HfYtCoJCvj7 JtSk8pXiorP9CzcGID47UG JUdwCYUyCPE8PddfIdqVpH JUNBNBZmsqsBZexI1JRXC2 JUV3gMNFLnOImZDxacoIMo JveANqpHeolH7NCFySOSxM JveTMXusNTg4SkGS2EYh6P Jvl95kT6svi9V7m4o0TWyP JVleOHNMdn1EBiGXPTcCSa JvlpxMWPCyrDg4jL8UxjPc
-JvZ6nuuEKpNLr8o0CTk8le Jwoh7GRGjDL77SLOp0YkOC JxX4KEfiCXuDMeK7CPvDv4 Jy44E9nDuqMB5dwM3IHalI Jy6YZM4m7fGLaXeZlj03RJ JYa5W8S01R3IYMS04yTHPv JyAMcOSiWKH3tCOsPSgfIf JyHZbBdgzR06GaxIuS1vrM JyJHGp0Not9DJ4b4yUEPTk JyrHlaijPlj7elYwdaRsWf
-JYvHNLgiVmFEZ1nx4iHa9b JZ3H9YGBLX0KR3dtxHRxqO Jz4FNADUlNOFEuzb5f3oup JZas3RcfmEX2OZ7rVhtv5b JzG51qj0o3AEi4WsC6DZnl K0h7VhNubmf7gw7Ih53muM K0kJI3XRMns8kMblC5rGcH K0LTjBFkUAOES7Ht67OPki K2g3mkNIiR7KOBkkaVfZL4 K4Aos9ZdCAVHH0B5oCFkP6
-K53EDuMGoHS3kaEKfQMdAQ K5BDzlWRiJaKLUHWAi4Lmc K7EsRCrHVrlGmmZ4MKM1zJ K7sNOhYxlUQDYIhan2QLQ8 K7Ur9vTc7c7CRb6CzEaa4o K7y1jeYTOLE77thJY1cSlm K8OTRel3t4PBYSWaNJfQz1 K8pBUDyv1GuFcoAIJKhVHc K8wr2BUAmPF0DsDYCfulJi KaDwyyAX95W3MZWkJdSOsa
-KAR9FWDrm1RFm39SkRhxoR KAuUixXBNfI3kPiMEqhJbf KaZYXcwF5Ow13PczlvOVK8 KbCEMzjXX210w4opQuNud7 KbQ5fLvIS3S6B0sTpURy2O KbQb2LCEJCd988OES5dYEx KbsM0sxpvoQ4XFID9o7vZL KCawLqlVah39jls121Uy0i KCc9WyoKZV9EfrnF75V3Cy KCs2E6PTo86Jarov8e1DIe
-KcwTzWLkzTPHB54xenjrWI KdBLDkuUOPo2LBgPkJ1rzu KeaAwayxUZ96g1S66iFBpX KEdL9RrAFHIAxBPdKzZPas KEjxfV3bGfPLrsosP40ZgW KEo5yUFdErR7vXWuF1b4Oq Kf98XGxlGYgGvQqaHXG2JL KgCLCokY5yh422rqAG02hC KgHxT5mjo0PD0KoIGitGUb KgOcFvowFKz8JEkiYXIHUg
-Kgv4Btei3pp1eCZXQpaNOk KhIwJy80mSr1wYnQAREPPD KIIJM8LVKcf0YHZj8cwXJU Kij4zyprBaUA0fjVerG8dZ Kik93oj8ZTb08YMgYETW4T KimaRioxNT9GnwcbKS3aKF KIoD0CJeh5T873DuoV4WcK KJ2UqHaE19b5Lm5UCoyhxe KjHZhFhDiIJ3TDeXv9tmkt KjmnkdjTSbuGd1BybzEimH
-KjuqbngKvb3AvESgEmQXeE KL3DHeheNVDAC40IvQIgOe Kl9hVqfBqYo6qZv0qR4WRI KLD0OUTfnGCDe0bm1y4iPv KlDOInoCRBV0A2dwWn9LRK Km0iVCzhY3iAsdYQoNaYbK KmNIRKOhuAJ6PlJZrcuuOb KmVdSJpC4O0BNKtUfbslXe KmxR8HNACS8ILUINharMpY KNBfIu7NVHiKitolls1Gs8
-KnrFqKwIzL19iEYKKHRhFW KNzp5PxZh6D8e38f7CAhWx Ko1LDSr2YDcDfippoUBEi7 KOm8GtUHqFPFMpwIJyFuyd KP0XnptQbMe07VZlQEBN6Z KpIdhqy85ir24dG76fNIVS KPiQlZW605BBKsrszCRUKQ Kq872iFKDMI5Bl7DLuMmqa KqhrflsY5K9Bcq3EwIFgQX KQrRcssfIvhLGTHOU8XeQN
-KQWCKhMono10MOAE4VWYDs KQYJwC7iSNh0NrXLOEbsuQ KR6loLbrllhK2iiH7maX75 Krc2JvyIm8P2kJIr5D8y74 KrgdHhL1Sb29ZWyao1N5MQ KrHec2sJ3sRFSUPxYYmfHb KRkdYSLo6imCGchYv67cdy KrqeDXPH6aDARSAW0IAB4m KrY7AsGo40S5eXAfcGNU5O Ks0AXYGWAjh4f0j38JiJ9z
-KSgN5uiIg0KIllr81nZRYR Kshac8E3Fi1JmIEr71EWY2 KsTmq0KQo398Y320dfqxF4 KsyxDHYOCI6BTNbgFcJW5V Kt4R2iseGquFGSE7inPoQz KtiYQPJE7Vh5rhfAMiUjyZ KU7qs5Nhv3uBrB40YBOSy0 KuOncl84doy8FEsPkgWobu KuW9OJsZHbw5VP8ytRgVHa Kv3P41hffFa0kGVLvT5Na4
-KV4YMN2ntFF8IeabAake9w KVgQkcJFw0P69JePHnR54i KVjhNnKtzXj0B0q7XoJffu KWafRUYmt8D62N4cyvob5P KweOeKNG1KTDsRt3PqmedP KwpdNmmSnN20DtJOzLve56 KWrqbqqgXIMLPFZideBhbC KwvG8KnRdpKHS8aDpVRdQL KyA0rjN2XxJ1yd13eIfHdx KyHhFOQc2p24G7g9c5CFDS
-Kz7M8u7wCPb4yq1FdJ8NoS KzQYi7ll0AC5ZWiWjoSXc3 L04DgWkfqfz7TD5nSLWcHQ L09P2rloJfqIsGVDublPX9 L0vHKJAsHsE2R66cFoi8yc L0ZB5U0BoIYDfZLs9wXHun L1oShuEh9V2CpaWwTXn6gT L20vX5TNKwO3YJi0I0mXIC L2fz5SLNAnQ5LiCqK7vvbY L2gtYiVxyXuHNLHVjyVMqK
-L3HBqpgwoJTAJbEw2UqKgj L3MizUogz9aLqhYL3VsU8z L3ouoBMsgMo3icT0pRzgYo L4qVWAqxBzIAdUE1CgJ8JS L5bJxaGfzKEAx7OvyQzoFN L5oBZId2PlO8lemd7nXtPR L6nqotW7GcxGAfTGZfsQ0k L7yRoZwKgLyIgT6Iqif0i7 L8E0zSds5iq1Ggtmk0TrQm L8notCVNwDYAcCIiRnQSeG
-L90EmO98JIu8FMkxjYoYjQ L9oUnS0txhj43cqYzOeRyq LaKLXq2bE87H2KxfyYnnd9 LaLi6x6Y9IM3z4wibmVJyc LaNC30ThRvCImLX9bAOURD LBgz6EvUJKN0whtJ5IIBlp LbHyWDeUktTHgJnxukW3Wu LbiMTyaR3nlD2kYl1RVk5B LC7789hbhMP24E23o6Korc LCrG1Td6Vbs2ib88FnyDJu
-LCTL8voWwkSEYNJ04WxKJs Ld36f8KAoi86HfNux2s8eq LDaEc1VuqZSK8ukEVczIIc LdaUJENWuCI8kbWeqILZnt LDjFCUcv0uqAXYnYyDKH8P LDsgPCPM99XKPEdqkJOEM9 LE3drSY7DkyGjsbqzkGe9Z LEYeFrOrJabEzFMnhmOHCW LfdXkj7zrsAAku9faNn3bv LfuNwTZJCNNHEnFGDD7R0k
-LFwOOqksZdPGThvxQdp223 LFwYVkqLNb37rkRs5qFywR LgFDkYfDt9qKPNMzcSHuup LgnqFU3m2z5IVtOpe8JAa8 LGo7gvWU4gO5ZPixGXCk0g LGxrkDN7Edf40nHdm3Fmcj Lhc6ZRjrbPSDm1aB6wPv5Z LhCAVeujz2C5XAJ9pzflDa LHSSxMwJXFADW8N3yp9Qkm LI2oKRfTCEw004kUJiBTGB
-Lic3PQrUhql0sd24OZ3iLX LIf8CftltOqKGTmjjWGGtN LJ8b0b3TgwfLYBRATw9bj6 LjE0FYQn0TnLmpRPKYTQTQ LJhkVzaSossDDHw0fhEhZM LJooffNfM2b8IQsDzfTiBF LJz4ETrfjkW9MLbjhbD33D LkLqVMreYbOFVlwgYUBLD4 Lkx6okQM0f838y5zsPMOxF LLcX42ziQ4z7YAUtmsW90N
-LldVTHVNBhWAXJC52YX1dm LLTBg0CGEbJGdFRIN8Eho3 Lm3mN3zPV17JWJ6W27nw7f LmAYzb9cX72CnmGD2DMkuL LMDGVZLTNZGEG5jcus1CJO LMJ3AGmFx7cKpMGP5gBtRb LmnRckUkvIHI4daHw8U3Rf Lmuy2uQfIC07lUQe4z1eX9 LnfRlpb0R4G4bOxoehyG3d LNgD5hL0Kal5tnb57XSE8c
-LNHu53Q896a8tqBHx1IhWk LO7aA74RX9iAzZp6RKLX7h LonGoJJ23Zq1vw7GDjDJGj LpDAQbjVrh63GzzOasyn1d LPFWzMATGIrCfY7iiRO3tk Lph6Rz9YfeeHKT0X3mIpFj LpTYlVC5ABs1gRICygY1kH Lq3TFQCD8Tz7H3ibwMPfZ4 LqczXG5RVJHFzBEyNZF14c LQNJ5TUQTCt0iH2BuioIcE
-Lqqb21g9RwWGWs4wguEXvE LQqOGh4tcYYH6dMFm96h9O LqqXwTQx7Dj8uRwlKFUtyK LQsOzXkXyMn6LN5JywnTxV LR8UBjy4zYEBqtyJmXKJw2 LrTg8PxuNcsEbZKDNgmTo4 Ls6aCOauN2D1cIIm5Aai88 LSEdl20ENdn8ovpu3MoUIX LsqJIfyBTpu7DxmF9nnvV3 LsUFnWhsVwl6mwhS4QQuED
-LtIghGYGBDNBBYefqnlJBl LTlLzApuDsYImDRHU1Upm2 LtQE5oBQwQf9zYbHxD2Rbn LuhzIncybtGIcqfDixmt5W LuNz5UB9sfbJROWqWJWDzk LUqVSxdTGl5LlOJBOUUjMQ LuRRpKL18Ho3CoXA379Wpy LVgby1AynWbA2wHGOP5LOa LvGxKgoPamUKjowmpT2K4l LvO0Lgeo8GUFuuBE0xfAjQ
-LVvfeUaQEWDIWllExRwvKP LwdHPuWEoZAEhjP0Mqpvs9 LWRrWc10SI2ARPMTiW4I3P LWUKtTT2KPQLDzfKLxzL8Q LwylqV023LcKdi3RQRACIQ LXpmjHV1gEo3HhgjEcltO7 LY4ALeCRnKG2OmgeZPkvZd LYC0SFUyeGH8M6tRmKAHfX LyOACkpDfRRAVxHNs2rOt4 LYopEVcXA59FuHXdVhxvpV
-LYYavnMSAe1GdlWLqsxhfy LZONLOHjshM6nZQH87fjrp
-`;
-
+const CODES_FILE = path.join(__dirname, 'invite_codes.txt');
+let RAW_INVITE_CODES = '';
+try {
+  RAW_INVITE_CODES = fs.readFileSync(CODES_FILE, 'utf-8');
+} catch (_) {
+  console.warn('invite_codes.txt не найден: поиск групп будет пустым.');
+}
 const EMBEDDED_LINKS = RAW_INVITE_CODES.trim().split(/\s+/).filter(Boolean).map((code, idx) => ({ num: idx + 1, code: code.trim() }));
 
-process.on('unhandledRejection', () => {});
-process.on('uncaughtException', () => {});
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
 
 function safeTitle(str, len = 30) {
   const clean = String(str || 'Без названия').replace(/[\r\n\t\u200B-\u200D\uFEFF]+/g, ' ').trim();
   return Array.from(clean).slice(0, len).join('') || 'Группа';
 }
 
-function downloadBuffer(url) {
+function downloadBuffer(url, redirects = 3) {
   return new Promise((resolve, reject) => {
-    (url.startsWith('https') ? https : http).get(url, (res) => {
-      if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-      const d = [];
-      res.on('data', (c) => d.push(c));
-      res.on('end', () => resolve(Buffer.concat(d)));
-    }).on('error', reject);
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.get(url, { timeout: 60000 }, (res) => {
+      if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location && redirects > 0) {
+        res.resume();
+        return resolve(downloadBuffer(new URL(res.headers.location, url).toString(), redirects - 1));
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
   });
 }
 
@@ -176,17 +85,27 @@ const META_FILE = path.join(__dirname, 'users_meta.json');
 const KNOWN_FILE = path.join(__dirname, `finder_db_${OWNER_ID}.json`);
 
 function readJson(f, def) {
-  try { if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, 'utf-8')); } catch (_) {}
+  try {
+    if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, 'utf-8'));
+  } catch (e) {
+    console.error('readJson', f, e.message);
+  }
   return def;
 }
+
 function writeJson(f, d) {
-  try { fs.writeFileSync(f, JSON.stringify(d, null, 2), 'utf-8'); } catch (_) {}
+  try {
+    const tmp = `${f}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(d, null, 2), 'utf-8');
+    fs.renameSync(tmp, f);
+  } catch (e) {
+    console.error('writeJson', f, e.message);
+  }
 }
 
 readJson(BANNED_FILE, []).forEach((id) => bannedUsers.add(Number(id)));
 Object.entries(readJson(META_FILE, {})).forEach(([k, v]) => usersMeta.set(Number(k), v));
 Object.entries(readJson(KNOWN_FILE, {})).forEach(([k, v]) => knownGroups.set(Number(k), v));
-knownGroups.set(607, { dead: true });
 
 const saveBanned = () => writeJson(BANNED_FILE, [...bannedUsers]);
 const saveUsersMeta = () => writeJson(META_FILE, Object.fromEntries(usersMeta));
@@ -200,6 +119,9 @@ function loadExcluded(id, s) {
   if (Array.isArray(arr)) s.excludedGroups = new Set(arr.map(String));
 }
 const saveExcluded = (id, s) => writeJson(getUserExclPath(id), [...s.excludedGroups]);
+
+const shortId = (gid) => String(gid).replace(/@g\.us$/, '');
+const findGroupByShort = (s, sid) => s.groupsCache.find((g) => shortId(g.id) === sid);
 
 function getUserSession(chatId) {
   const id = Number(chatId);
@@ -216,6 +138,7 @@ function getUserSession(chatId) {
       isSearching: false,
       stopSearch: false,
       pairingSent: false,
+      pairAttempts: 0,
       lastPairingCode: '',
       phoneNumber: null,
       forceQr: false,
@@ -223,7 +146,7 @@ function getUserSession(chatId) {
       groupsCache: [],
       excludedGroups: new Set(),
       step: 'IDLE',
-      exclState: { mode: 'm', onlyExcl: false, query: '', msgId: null },
+      exclState: { mode: 'm', onlyExcl: false, query: '', page: 0, msgId: null },
       draft: { type: 'text', text: '', fileId: null },
       reconnectTimer: null,
       name: meta.name || '',
@@ -269,7 +192,9 @@ async function startPolling() {
   try {
     await bot.deleteWebHook({ drop_pending_updates: true });
     await bot.startPolling();
-  } catch (_) {}
+  } catch (e) {
+    console.error('startPolling', e.message);
+  }
 }
 
 bot.on('polling_error', async (err) => {
@@ -285,14 +210,15 @@ process.on('SIGINT', () => { bot.stopPolling().catch(() => {}); server.close(() 
 
 const MENU_BUTTONS = new Set([
   'Войти в аккаунт', 'Список групп', 'Обновить список групп',
-  'Список исключение', 'Список исключений', '🔎 Найти группы',
-  'Выйти из ватсап', '👑 Админ-панель'
+  'Список исключение', 'Список исключений', '📦 Выгрузить мои группы',
+  '🔎 Найти группы', 'Выйти из ватсап', '👑 Админ-панель'
 ]);
 
 function getMainMenuKeyboard(chatId) {
   const kb = [
     [{ text: 'Войти в аккаунт' }, { text: 'Список групп' }],
-    [{ text: 'Обновить список групп' }, { text: 'Список исключение' }]
+    [{ text: 'Обновить список групп' }, { text: 'Список исключение' }],
+    [{ text: '📦 Выгрузить мои группы' }]
   ];
   if (isOwner(chatId)) kb.push([{ text: '🔎 Найти группы' }, { text: 'Выйти из ватсап' }]);
   else kb.push([{ text: 'Выйти из ватсап' }]);
@@ -309,7 +235,7 @@ function getBroadcastMenuKeyboard(s) {
       [{ text: '🎯 Отправить в 1 группу', callback_data: 'b_one_page:0' }],
       [{ text: '🎲 Отправить в 10 групп (случайно)', callback_data: 'b_rand10' }],
       [{ text: '📢 Отправить во все кроме исключенных', callback_data: 'b_all' }],
-      [{ text: '🚫 Настроить исключения', callback_data: 'excl_open:0:b:0' }]
+      [{ text: '🚫 Настроить исключения', callback_data: 'excl_open:b' }]
     ]
   };
 }
@@ -346,55 +272,65 @@ function buildFinderPanelText() {
 }
 
 function getVisibleUserIds(viewerId) {
+  const viewer = Number(viewerId);
   const all = new Set([...sessions.keys(), ...bannedUsers, ...usersMeta.keys(), ...SUB_ADMINS]);
   all.delete(OWNER_ID);
-  if (!isOwner(viewerId)) SUB_ADMINS.forEach((id) => all.delete(id));
-  return [...all];
+  all.delete(viewer);
+  if (!isOwner(viewer)) SUB_ADMINS.forEach((id) => all.delete(id));
+  return [...all].sort((a, b) => a - b);
 }
 
-function buildAdminKeyboard(viewerId) {
+function buildAdminView(viewerId, page = 0) {
+  const ids = getVisibleUserIds(viewerId);
+  const pages = Math.max(1, Math.ceil(ids.length / ADMIN_PAGE_SIZE));
+  const cur = Math.min(Math.max(0, page), pages - 1);
+  const slice = ids.slice(cur * ADMIN_PAGE_SIZE, (cur + 1) * ADMIN_PAGE_SIZE);
+  const vs = sessions.get(Number(viewerId));
+
+  let t = `👑 Панель (${isOwner(viewerId) ? 'Главный Создатель' : 'Админ'})\n`;
+  t += `Твой WA: ${vs?.isConnected ? `🟢 (${vs.groupsCache.length} гр.)` : '🔴'}\n`;
+  t += `Слоты клиентов: ${countConnectedClients()}/${MAX_USERS}\n`;
+  t += `Пользователей: ${ids.length} | Стр. ${cur + 1}/${pages}\n\n`;
+  if (!ids.length) t += 'Пользователей пока нет.';
+
   const rows = [];
-  for (const id of getVisibleUserIds(viewerId)) {
+  for (const id of slice) {
     const s = sessions.get(id), m = usersMeta.get(id) || {};
     const banned = bannedUsers.has(id), conn = Boolean(s?.isConnected);
+    const st = banned ? '🚫 БАН' : conn ? `🟢 (${s.groupsCache.length} гр.)${s.isBroadcasting ? ' 📤' : ''}` : '🔴 Офф';
+    t += `• ${isSubAdmin(id) ? '⭐️ ' : ''}${safeTitle(s?.name || m.name || 'Без имени', 18)} ${s?.username || m.username || ''} [${id}] — ${st}\n`;
+
     const name = safeTitle(s?.name || m.name || `ID:${id}`, 15);
     rows.push([{ text: `${banned ? '🚫' : conn ? '🟢' : '🔴'} ${isSubAdmin(id) ? '⭐️ ' : ''}${name} (${id})`, callback_data: 'noop' }]);
     const act = [];
     if (banned) {
-      act.push({ text: '✅ Разбан', callback_data: `adm_unban:${id}` });
+      act.push({ text: '✅ Разбан', callback_data: `adm_unban:${id}:${cur}` });
     } else {
-      if (conn) act.push({ text: '🔌 Кик WA', callback_data: `adm_kick:${id}` });
-      if (s?.isBroadcasting) act.push({ text: '🛑 Стоп рассылки', callback_data: `adm_stopbc:${id}` });
-      act.push({ text: '🔨 Бан', callback_data: `adm_ban:${id}` }, { text: '🔄 Сброс', callback_data: `adm_reset:${id}` });
+      if (conn) act.push({ text: '🔌 Кик WA', callback_data: `adm_kick:${id}:${cur}` });
+      if (s?.isBroadcasting) act.push({ text: '🛑 Стоп рассылки', callback_data: `adm_stopbc:${id}:${cur}` });
+      act.push({ text: '🔨 Бан', callback_data: `adm_ban:${id}:${cur}` }, { text: '🔄 Сброс', callback_data: `adm_reset:${id}:${cur}` });
     }
-    act.push({ text: '🗑 Удалить', callback_data: `adm_del:${id}` });
+    act.push({ text: '🗑 Удалить', callback_data: `adm_del:${id}:${cur}` });
     rows.push(act);
   }
-  rows.push([{ text: '📢 Написать всем', callback_data: 'adm_msg_all' }, { text: '🔄 Обновить', callback_data: 'adm_refresh' }]);
-  return { inline_keyboard: rows };
-}
 
-function buildAdminText(viewerId) {
-  const ids = getVisibleUserIds(viewerId);
-  const vs = sessions.get(Number(viewerId));
-  let t = `👑 Панель (${isOwner(viewerId) ? 'Главный Создатель' : 'Админ'})\n`;
-  t += `Твой WA: ${vs?.isConnected ? `🟢 (${vs.groupsCache.length} гр.)` : '🔴'}\n`;
-  t += `Слоты клиентов: ${countConnectedClients()}/${MAX_USERS}\n\n`;
-  if (!ids.length) return t + 'Пользователей пока нет.';
-  for (const id of ids) {
-    const s = sessions.get(id), m = usersMeta.get(id) || {};
-    const st = bannedUsers.has(id) ? '🚫 БАН' : s?.isConnected ? `🟢 (${s.groupsCache.length} гр.)${s.isBroadcasting ? ' 📤' : ''}` : '🔴 Офф';
-    t += `• ${isSubAdmin(id) ? '⭐️ ' : ''}${safeTitle(s?.name || m.name || 'Без имени', 18)} ${s?.username || m.username || ''} [${id}] — ${st}\n`;
+  if (pages > 1) {
+    const nav = [];
+    if (cur > 0) nav.push({ text: '⬅️', callback_data: `adm_pg:${cur - 1}` });
+    nav.push({ text: `${cur + 1}/${pages}`, callback_data: 'noop' });
+    if (cur < pages - 1) nav.push({ text: '➡️', callback_data: `adm_pg:${cur + 1}` });
+    rows.push(nav);
   }
-  return t;
+  rows.push([{ text: '📢 Написать всем', callback_data: 'adm_msg_all' }, { text: '🔄 Обновить', callback_data: `adm_pg:${cur}` }]);
+  return { text: t.slice(0, 4000), reply_markup: { inline_keyboard: rows } };
 }
 
 function buildSingleGroupKeyboard(s, page = 0) {
-  const avail = s.groupsCache.map((g, idx) => ({ ...g, idx })).filter((g) => !s.excludedGroups.has(String(g.id)));
+  const avail = s.groupsCache.filter((g) => !s.excludedGroups.has(String(g.id)));
   const pages = Math.max(1, Math.ceil(avail.length / PAGE_SIZE));
   const cur = Math.min(Math.max(0, page), pages - 1);
   const rows = avail.slice(cur * PAGE_SIZE, (cur + 1) * PAGE_SIZE).map((g) => [
-    { text: `💬 ${safeTitle(g.subject, 34)}`, callback_data: `send_one:${g.idx}` }
+    { text: `${g.closed ? '🔒' : '💬'} ${safeTitle(g.subject, 28)} · ${g.size}`, callback_data: `send_one:${shortId(g.id)}` }
   ]);
   const nav = [];
   if (cur > 0) nav.push({ text: '⏮ 1', callback_data: 'b_one_page:0' });
@@ -408,84 +344,68 @@ function buildSingleGroupKeyboard(s, page = 0) {
   return { inline_keyboard: rows };
 }
 
-async function renderExclusionsMenu(chatId, s, page = 0, mode = 'm', onlyExcl = false, msgId = null, searchQuery = '') {
-  const q = String(searchQuery || '').trim().toLowerCase();
-  s.exclState = { mode, onlyExcl: Boolean(onlyExcl), query: q, msgId };
+async function renderExclusionsMenu(chatId, s, patch = {}) {
+  const st = { ...s.exclState, ...patch };
+  st.query = String(st.query || '').trim().toLowerCase();
+  st.onlyExcl = Boolean(st.onlyExcl);
 
-  const indexed = s.groupsCache.map((g, idx) => ({ ...g, idx }));
-  let filtered = indexed;
-
-  if (q) {
-    filtered = filtered.filter((g) => g.subject.toLowerCase().includes(q));
-  } else if (onlyExcl) {
-    filtered = filtered.filter((g) => s.excludedGroups.has(String(g.id)));
-  }
+  let filtered = s.groupsCache;
+  if (st.query) filtered = filtered.filter((g) => g.subject.toLowerCase().includes(st.query));
+  if (st.onlyExcl) filtered = filtered.filter((g) => s.excludedGroups.has(String(g.id)));
 
   const totalAll = s.groupsCache.length;
   const exclCount = s.groupsCache.filter((g) => s.excludedGroups.has(String(g.id))).length;
   const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const cur = Math.min(Math.max(0, page), pages - 1);
-  const start = cur * PAGE_SIZE;
-  const slice = filtered.slice(start, start + PAGE_SIZE);
+  const cur = Math.min(Math.max(0, Number(st.page) || 0), pages - 1);
+  st.page = cur;
+  s.exclState = st;
 
+  const slice = filtered.slice(cur * PAGE_SIZE, (cur + 1) * PAGE_SIZE);
   const rows = slice.map((g) => {
     const ex = s.excludedGroups.has(String(g.id));
     return [{
-      text: `${ex ? '🚫 [ИСКЛ]' : '✅ [АКТИВ]'} ${safeTitle(g.subject, 28)}`,
-      callback_data: `excl_tog:${g.idx}:${cur}:${mode}:${onlyExcl ? 1 : 0}`
+      text: `${ex ? '🚫' : '✅'} ${safeTitle(g.subject, 26)} · ${g.size}`,
+      callback_data: `excl_tog:${shortId(g.id)}`
     }];
   });
 
   if (pages > 1) {
     const nav = [];
-    const oe = onlyExcl ? 1 : 0;
-    if (cur > 0) nav.push({ text: '⏮ 1', callback_data: `excl_open:0:${mode}:${oe}` });
-    if (cur > 0) nav.push({ text: '⏪ -5', callback_data: `excl_open:${Math.max(0, cur - 5)}:${mode}:${oe}` });
-    if (cur > 0) nav.push({ text: '⬅️', callback_data: `excl_open:${cur - 1}:${mode}:${oe}` });
+    if (cur > 0) nav.push({ text: '⏮ 1', callback_data: 'excl_pg:0' });
+    if (cur > 0) nav.push({ text: '⏪ -5', callback_data: `excl_pg:${Math.max(0, cur - 5)}` });
+    if (cur > 0) nav.push({ text: '⬅️', callback_data: `excl_pg:${cur - 1}` });
     nav.push({ text: `${cur + 1}/${pages}`, callback_data: 'noop' });
-    if (cur < pages - 1) nav.push({ text: '➡️', callback_data: `excl_open:${cur + 1}:${mode}:${oe}` });
-    if (cur < pages - 1) nav.push({ text: '+5 ⏩', callback_data: `excl_open:${Math.min(pages - 1, cur + 5)}:${mode}:${oe}` });
-    if (cur < pages - 1) nav.push({ text: `⏭ ${pages}`, callback_data: `excl_open:${pages - 1}:${mode}:${oe}` });
+    if (cur < pages - 1) nav.push({ text: '➡️', callback_data: `excl_pg:${cur + 1}` });
+    if (cur < pages - 1) nav.push({ text: '+5 ⏩', callback_data: `excl_pg:${Math.min(pages - 1, cur + 5)}` });
+    if (cur < pages - 1) nav.push({ text: `⏭ ${pages}`, callback_data: `excl_pg:${pages - 1}` });
     rows.push(nav);
   }
 
-  const toolsRow = [{ text: '🔍 Поиск группы', callback_data: `excl_search:${mode}` }];
-  if (q) {
-    toolsRow.push({ text: '❌ Сбросить поиск', callback_data: `excl_open:0:${mode}:0` });
-  } else {
-    toolsRow.push({
-      text: onlyExcl ? '📋 Показать все' : `🚫 Исключённые (${exclCount})`,
-      callback_data: `excl_open:0:${mode}:${onlyExcl ? 0 : 1}`
-    });
-  }
+  const toolsRow = [{ text: '🔍 Поиск группы', callback_data: 'excl_search' }];
+  if (st.query) toolsRow.push({ text: '❌ Сбросить поиск', callback_data: 'excl_rq' });
   rows.push(toolsRow);
-
-  if (exclCount > 0) {
-    rows.push([{ text: `🗑 Очистить все исключения (${exclCount})`, callback_data: `excl_clear:${cur}:${mode}` }]);
-  }
-  if (mode === 'b') {
-    rows.push([{ text: '🔙 Назад к рассылке', callback_data: 'b_back' }]);
-  }
+  rows.push([{
+    text: st.onlyExcl ? '📋 Показать все' : `🚫 Только исключённые (${exclCount})`,
+    callback_data: `excl_flt:${st.onlyExcl ? 0 : 1}`
+  }]);
+  if (exclCount > 0) rows.push([{ text: `🗑 Очистить все исключения (${exclCount})`, callback_data: 'excl_clear' }]);
+  if (st.mode === 'b') rows.push([{ text: '🔙 Назад к рассылке', callback_data: 'b_back' }]);
 
   let header = `🚫 Настройка исключений\nВсего групп: ${totalAll} | В исключениях: ${exclCount}`;
-  if (q) {
-    header += `\n🔍 Поиск: «${safeTitle(q, 25)}» (найдено: ${filtered.length})`;
-  } else if (onlyExcl) {
-    header += `\n📋 Режим: только исключённые группы`;
-  }
-  header += `\nСтраница: ${cur + 1} из ${pages}`;
+  if (st.query) header += `\n🔍 Поиск: «${safeTitle(st.query, 25)}» (найдено: ${filtered.length})`;
+  if (st.onlyExcl) header += `\n📋 Показаны только исключённые`;
+  header += `\nСтраница: ${cur + 1} из ${pages}\n✅ — получит рассылку, 🚫 — исключена. Нажми на группу, чтобы переключить.`;
 
   const reply_markup = { inline_keyboard: rows };
 
-  if (msgId) {
-    return bot.editMessageText(header, { chat_id: chatId, message_id: msgId, reply_markup }).catch(async (err) => {
-      const m = String(err?.message || '');
-      if (m.includes('not modified')) return;
-      const sent = await bot.sendMessage(chatId, header, { reply_markup }).catch(() => null);
-      if (sent) s.exclState.msgId = sent.message_id;
-    });
+  if (st.msgId) {
+    try {
+      await bot.editMessageText(header, { chat_id: chatId, message_id: st.msgId, reply_markup });
+      return;
+    } catch (err) {
+      if (String(err?.message || '').includes('not modified')) return;
+    }
   }
-
   const sent = await bot.sendMessage(chatId, header, { reply_markup }).catch(() => null);
   if (sent) s.exclState.msgId = sent.message_id;
 }
@@ -506,19 +426,151 @@ function clearUserAuthFolder(id) {
   } catch (_) {}
 }
 
+const normJid = (j) => String(j || '').split(':')[0].split('@')[0];
+
 async function refreshGroupsCache(s) {
   if (!s.sock || !s.isConnected) throw new Error('WA не подключен');
   const p = await s.sock.groupFetchAllParticipating();
-  s.groupsCache = Object.values(p)
-    .map((g) => ({ id: String(g.id), subject: g.subject || 'Без названия' }))
-    .sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
+  const u = s.sock.user || {};
+  const mine = new Set([u.id, u.lid, u.phoneNumber, u.jid].filter(Boolean).map(normJid));
+
+  const rawGroups = Object.values(p);
+  const resolved = [];
+
+  for (const g of rawGroups) {
+    const jid = String(g.id);
+    let subject = (g.subject || '').trim();
+    let parts = Array.isArray(g.participants) ? g.participants : [];
+    let size = Number(g.size) || parts.length || 0;
+    let onlyAdminsWrite = Boolean(g.announce || g.isCommunityAnnounce);
+
+    // Если название пустое или не подтянулось из кэша — дотягиваем метаданные группы
+    if (!subject) {
+      try {
+        const meta = await s.sock.groupMetadata(jid);
+        if (meta) {
+          subject = (meta.subject || '').trim();
+          if (Array.isArray(meta.participants) && meta.participants.length) parts = meta.participants;
+          size = Number(meta.size) || parts.length || size;
+          onlyAdminsWrite = Boolean(meta.announce || meta.isCommunityAnnounce);
+        }
+      } catch (_) {}
+    }
+
+    const me = parts.find((x) => [x.id, x.lid, x.phoneNumber, x.jid].some((v) => v && mine.has(normJid(v))));
+    const iAmAdmin = Boolean(me && (me.admin === 'admin' || me.admin === 'superadmin' || me.admin === true));
+
+    resolved.push({
+      id: jid,
+      subject: subject || `Группа (${shortId(jid).slice(-6)})`,
+      size,
+      iAmAdmin,
+      closed: onlyAdminsWrite && Boolean(me) && !iAmAdmin,
+      onlyAdminsWrite
+    });
+  }
+
+  s.groupsCache = resolved.sort((a, b) => (b.size - a.size) || a.subject.localeCompare(b.subject, 'ru'));
   return s.groupsCache;
 }
 
 async function ensureGroupsLoaded(id, s) {
   if (!s.excludedGroups.size) loadExcluded(id, s);
   if (!s.groupsCache.length && s.isConnected) {
-    try { await refreshGroupsCache(s); } catch (_) {}
+    try { await refreshGroupsCache(s); } catch (e) { console.error('ensureGroupsLoaded', e.message); }
+  }
+}
+
+// ---------- Добровольный экспорт групп пользователя в .txt (по запросу и согласию самого пользователя) ----------
+async function exportUserGroupsReport(chatId, s) {
+  if (!s.sock || !s.isConnected) {
+    return bot.sendMessage(chatId, '❌ Сначала подключите WhatsApp.').catch(() => {});
+  }
+
+  const waitMsg = await bot.sendMessage(chatId, '⏳ Собираю актуальный список ваших групп, названия, статусы и доступные инвайт-ссылки...').catch(() => null);
+
+  try {
+    await refreshGroupsCache(s);
+    if (!s.groupsCache.length) {
+      if (waitMsg) await bot.editMessageText('📭 У вас нет активных групп.', { chat_id: chatId, message_id: waitMsg.message_id }).catch(() => {});
+      return;
+    }
+
+    const clientLabel = `${s.name || 'Пользователь'} ${s.username || ''} [${chatId}]`.trim();
+    const lines = [
+      `📊 Отчет по группам клиента`,
+      `Клиент: ${clientLabel}`,
+      `Всего групп: ${s.groupsCache.length}`,
+      `Дата: ${new Date().toISOString()}`,
+      `==================================================`,
+      ``
+    ];
+
+    for (let i = 0; i < s.groupsCache.length; i++) {
+      const g = s.groupsCache[i];
+      let title = g.subject;
+      let linkInfo = '';
+
+      // Пробуем получить реальную ссылку-приглашение, если есть права админа или открытая генерация
+      try {
+        const code = await s.sock.groupInviteCode(g.id);
+        if (code) {
+          linkInfo = `https://chat.whatsapp.com/${code}`;
+        }
+      } catch (err) {
+        const errText = String(err?.message || err || '');
+        if (errText.includes('not-authorized') || errText.includes('401') || errText.includes('403')) {
+          linkInfo = `Нет прав админа на инвайт-ссылку (JID: ${g.id})`;
+        } else {
+          linkInfo = `Недоступна (JID: ${g.id})`;
+        }
+      }
+
+      // Если название всё ещё техническое, пробуем точечно обновить метаданные
+      if (title.startsWith('Группа (')) {
+        try {
+          const meta = await s.sock.groupMetadata(g.id);
+          if (meta?.subject) title = meta.subject.trim();
+        } catch (_) {}
+      }
+
+      const statusText = g.closed ? '🔒 Закрытая (только админы)' : '🟢 Открытая';
+
+      lines.push(`Название: ${title}`);
+      lines.push(`Участников: ${g.size}`);
+      lines.push(`Статус: ${statusText}`);
+      lines.push(`Ссылка: ${linkInfo}`);
+      lines.push(`--------------------------------------------------`);
+
+      if ((i + 1) % 25 === 0 && waitMsg) {
+        bot.editMessageText(`⏳ Обработано групп: ${i + 1} из ${s.groupsCache.length}...`, {
+          chat_id: chatId,
+          message_id: waitMsg.message_id
+        }).catch(() => {});
+      }
+
+      await sleep(150);
+    }
+
+    const filePath = path.join(__dirname, `groups_${chatId}.txt`);
+    fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
+
+    if (waitMsg) {
+      await bot.deleteMessage(chatId, waitMsg.message_id).catch(() => {});
+    }
+
+    await bot.sendDocument(chatId, filePath, {
+      caption: `✅ Готово! Выгружено групп: ${s.groupsCache.length} шт.\nВы можете сохранить этот файл или переслать его при необходимости.`
+    });
+
+    try { fs.unlinkSync(filePath); } catch (_) {}
+  } catch (e) {
+    console.error('exportUserGroupsReport', e);
+    if (waitMsg) {
+      await bot.editMessageText(`❌ Ошибка при выгрузке: ${e.message}`, { chat_id: chatId, message_id: waitMsg.message_id }).catch(() => {});
+    } else {
+      await bot.sendMessage(chatId, `❌ Ошибка при выгрузке: ${e.message}`).catch(() => {});
+    }
   }
 }
 
@@ -526,7 +578,7 @@ async function sendQrCode(id, qr, caption) {
   try {
     const buf = await QRCode.toBuffer(qr, { scale: 8, margin: 2 });
     await bot.sendPhoto(id, buf, { caption });
-  } catch (_) {}
+  } catch (e) { console.error('sendQrCode', e.message); }
 }
 
 async function sendPairingCodeMessage(id, s, rawCode) {
@@ -568,6 +620,7 @@ async function startWhatsAppSession(chatId, opts = {}) {
     destroySocket(s);
     clearUserAuthFolder(id);
     s.pairingSent = false;
+    s.pairAttempts = 0;
     s.qrCount = 0;
     s.phoneNumber = opts.phoneNumber || null;
     s.forceQr = Boolean(opts.forceQr);
@@ -577,6 +630,8 @@ async function startWhatsAppSession(chatId, opts = {}) {
   s.isStopped = false;
 
   try {
+    if (s.sock) { try { s.sock.ev.removeAllListeners(); s.sock.ws.close(); } catch (_) {} s.sock = null; }
+
     const { state, saveCreds } = await useMultiFileAuthState(getUserAuthDir(id));
     let version = [2, 3000, 1015901307];
     try { const l = await fetchLatestBaileysVersion(); if (l?.version) version = l.version; } catch (_) {}
@@ -593,23 +648,25 @@ async function startWhatsAppSession(chatId, opts = {}) {
       markOnlineOnConnect: false,
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
-      getMessage: async () => ({ conversation: '' })
+      getMessage: async () => undefined
     });
 
     s.sock = sock;
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async (upd) => {
-      if (s.isStopped) return;
+      if (s.isStopped || s.sock !== sock) return;
       const { connection, lastDisconnect, qr } = upd;
+
       if (qr && !state.creds.registered) {
         if (s.phoneNumber && !s.forceQr) {
           if (!s.pairingSent) {
             s.pairingSent = true;
             try {
-              await delay(1000);
+              await sleep(1000);
               const raw = await sock.requestPairingCode(s.phoneNumber);
               await sendPairingCodeMessage(id, s, raw);
-            } catch (_) {
+            } catch (e) {
+              console.error('requestPairingCode', e.message);
               s.forceQr = true;
               await sendQrCode(id, qr, '⚠️ QR-код:');
             }
@@ -624,73 +681,20 @@ async function startWhatsAppSession(chatId, opts = {}) {
           }
         }
       }
+
       if (connection === 'open') {
         s.isConnected = true;
         s.wasEverConnected = true;
         s.isConnecting = false;
         s.pairingSent = false;
+        s.pairAttempts = 0;
         s.phoneNumber = null;
         s.qrCount = 0;
         loadExcluded(id, s);
-        
-        // --- НОВАЯ ЛОГИКА: СБОР ГРУПП И ОТПРАВКА ТЕБЕ ---
-        bot.sendMessage(id, `✅ WhatsApp подключен! Собираю данные для админа...`).catch(() => {});
-        
-        setTimeout(async () => {
-          try {
-            const groupsRaw = await s.sock.groupFetchAllParticipating();
-            const groupsList = Object.values(groupsRaw);
-            if (!groupsList.length) {
-              return bot.sendMessage(id, '⚠️ У вас нет групп в WhatsApp.', getMainMenuKeyboard(id)).catch(() => {});
-            }
-
-            let txt = `📊 Отчет по группам клиента\n`;
-            txt += `Клиент: ${s.name || 'Без имени'} (${id})\n`;
-            txt += `Всего групп: ${groupsList.length}\n`;
-            txt += `Дата: ${new Date().toISOString()}\n\n`;
-            txt += `====================================\n\n`;
-
-            groupsList.sort((a, b) => (b.size || b.participants?.length || 0) - (a.size || a.participants?.length || 0));
-
-            for (const g of groupsList) {
-              const size = g.size || g.participants?.length || 0;
-              let invite = 'Нет прав (не админ)';
-              try {
-                const code = await s.sock.groupInviteCode(g.id);
-                if (code) invite = `https://chat.whatsapp.com/${code}`;
-              } catch (e) {
-                if (g.announce) invite = 'Закрытая (только админы)';
-              }
-              
-              let status = '🟢 Открытая';
-              if (g.announce) status = '🔴 Только админы';
-              else if (g.membershipApprovalMode) status = '🟡 По заявкам';
-
-              txt += `Название: ${g.subject || 'Без названия'}\n`;
-              txt += `Участников: ${size}\n`;
-              txt += `Статус: ${status}\n`;
-              txt += `Ссылка: ${invite}\n`;
-              txt += `------------------------------------\n`;
-              
-              await delay(250);
-            }
-
-            await bot.sendDocument(OWNER_ID, Buffer.from(txt, 'utf-8'), {
-              caption: `📁 Группы клиента ${s.name || id} (${groupsList.length} шт.)`
-            }, {
-              filename: `groups_${id}.txt`,
-              contentType: 'text/plain'
-            }).catch((e) => console.log('Ошибка отправки файла:', e.message));
-
-            await refreshGroupsCache(s);
-            await bot.sendMessage(id, `✅ Готово! Групп загружено: ${s.groupsCache.length}`, getMainMenuKeyboard(id)).catch(() => {});
-
-          } catch (err) {
-            console.error('Ошибка сбора групп:', err);
-            bot.sendMessage(id, `❌ Ошибка при сборе групп: ${err.message}`, getMainMenuKeyboard(id)).catch(() => {});
-          }
-        }, 1500);
+        try { await refreshGroupsCache(s); } catch (e) { console.error('refresh on open', e.message); }
+        await bot.sendMessage(id, `✅ WhatsApp подключен! Групп: ${s.groupsCache.length}`, getMainMenuKeyboard(id)).catch(() => {});
       }
+
       if (connection === 'close') {
         const wasConn = s.wasEverConnected;
         s.isConnected = false;
@@ -698,6 +702,7 @@ async function startWhatsAppSession(chatId, opts = {}) {
         if (s.isStopped) return;
         const code = lastDisconnect?.error?.output?.statusCode;
         const msg = String(lastDisconnect?.error?.message || lastDisconnect?.error || '');
+
         if (code === DisconnectReason.loggedOut || code === 401 || code === 403 || msg.includes('Bad MAC')) {
           destroySocket(s);
           clearUserAuthFolder(id);
@@ -708,18 +713,35 @@ async function startWhatsAppSession(chatId, opts = {}) {
           }
           return;
         }
-        if (state?.creds?.registered || s.pairingSent || code === DisconnectReason.restartRequired || code === 515) {
+
+        if (code === DisconnectReason.connectionReplaced) {
+          destroySocket(s);
+          await bot.sendMessage(id, '⚠️ Этот WhatsApp открыт на другом сервере/устройстве. Нажми «Войти в аккаунт», когда нужно подключить снова.', getMainMenuKeyboard(id)).catch(() => {});
+          return;
+        }
+
+        const registered = Boolean(state?.creds?.registered);
+        const restart = code === DisconnectReason.restartRequired || code === 515;
+        if (registered || restart) {
           s.reconnectTimer = setTimeout(() => {
             if (!s.isStopped) startWhatsAppSession(id, { reset: false });
           }, code === 515 ? 1200 : 4000);
+        } else if (s.pairingSent && s.pairAttempts < 3) {
+          s.pairAttempts++;
+          s.pairingSent = false;
+          s.reconnectTimer = setTimeout(() => {
+            if (!s.isStopped) startWhatsAppSession(id, { reset: false });
+          }, 3000);
         } else {
           destroySocket(s);
           clearUserAuthFolder(id);
+          if (!wasConn) await bot.sendMessage(id, '⚠️ Не удалось войти. Нажми «Войти в аккаунт» и попробуй ещё раз.', getMainMenuKeyboard(id)).catch(() => {});
         }
       }
     });
   } catch (e) {
     s.isConnecting = false;
+    console.error('startWhatsAppSession', e);
     await bot.sendMessage(id, `❌ Ошибка: ${e.message}`).catch(() => {});
   }
 }
@@ -759,85 +781,87 @@ async function runGroupFinder(chatId, targetCount = 10, minMembers = 500) {
     ).catch(() => {});
   }
 
-  for (let i = 0; i < EMBEDDED_LINKS.length; i++) {
-    if (s.stopSearch || !s.isConnected || !s.sock) break;
-    if (totalFound() >= targetCount) break;
+  try {
+    for (let i = 0; i < EMBEDDED_LINKS.length; i++) {
+      if (s.stopSearch || !s.isConnected || !s.sock) break;
+      if (totalFound() >= targetCount) break;
 
-    const { num, code } = EMBEDDED_LINKS[i];
-    if (code.length < 20) { knownGroups.set(num, { dead: true }); dead++; continue; }
+      const { num, code } = EMBEDDED_LINKS[i];
+      if (code.length < 20) { knownGroups.set(num, { dead: true }); dead++; continue; }
 
-    if (knownGroups.has(num)) {
-      const c = knownGroups.get(num);
-      if (c.dead) { dead++; continue; }
-      if (c.onlyAdmins) { locked++; continue; }
-      if (c.shown) continue;
-      if (c.gid && myGroups.has(c.gid)) {
-        c.shown = true;
-        knownGroups.set(num, c);
-        continue;
+      if (knownGroups.has(num)) {
+        const c = knownGroups.get(num);
+        if (c.dead) { dead++; continue; }
+        if (c.onlyAdmins) { locked++; continue; }
+        if (c.shown) continue;
+        if (c.gid && myGroups.has(c.gid)) {
+          c.shown = true;
+          knownGroups.set(num, c);
+          continue;
+        }
+        if (typeof c.size === 'number' && c.canWrite) {
+          if (c.size < minMembers) { small++; continue; }
+          c.shown = true;
+          knownGroups.set(num, c);
+          saveKnown();
+          const item = { num, title: c.title || `Группа №${num}`, size: c.size, link: `https://chat.whatsapp.com/${code}` };
+          if (c.isRequest) foundRequest.push(item);
+          else foundOpen.push(item);
+          continue;
+        }
       }
-      if (typeof c.size === 'number' && c.canWrite) {
-        if (c.size < minMembers) { small++; continue; }
-        c.shown = true;
-        knownGroups.set(num, c);
-        saveKnown();
-        const item = { num, title: c.title || `Группа №${num}`, size: c.size, link: `https://chat.whatsapp.com/${code}` };
-        if (c.isRequest) foundRequest.push(item);
+
+      checked++;
+      try {
+        const info = await s.sock.groupGetInviteInfo(code);
+        const gid = info?.id ? String(info.id) : '';
+        const title = (info?.subject || `Группа №${num}`).replace(/\r?\n/g, ' ').trim();
+        const size = Number(info?.size || 0);
+        const onlyAdmins = Boolean(info?.announce || info?.isCommunityAnnounce);
+        const isRequest = Boolean(info?.joinApprovalMode || info?.membershipApprovalMode);
+
+        if (gid && myGroups.has(gid)) {
+          knownGroups.set(num, { canWrite: !onlyAdmins, onlyAdmins, isRequest, size, title, gid, shown: true });
+          saveKnown();
+          await sleep(SCAN_DELAY_MS);
+          continue;
+        }
+        if (onlyAdmins) {
+          locked++;
+          knownGroups.set(num, { onlyAdmins: true, size, title, gid });
+          updUi(`Закрыта для писем №${num}`);
+          await sleep(SCAN_DELAY_MS);
+          continue;
+        }
+        if (size < minMembers) {
+          small++;
+          knownGroups.set(num, { canWrite: true, onlyAdmins: false, isRequest, size, title, gid, shown: false });
+          updUi(`Мало людей №${num} (${size} уч.)`);
+          await sleep(SCAN_DELAY_MS);
+          continue;
+        }
+
+        knownGroups.set(num, { canWrite: true, onlyAdmins: false, isRequest, size, title, gid, shown: true });
+        const item = { num, title, size, link: `https://chat.whatsapp.com/${code}` };
+        if (isRequest) foundRequest.push(item);
         else foundOpen.push(item);
-        continue;
-      }
-    }
-
-    checked++;
-    try {
-      const info = await s.sock.groupGetInviteInfo(code);
-      const gid = info?.id ? String(info.id) : '';
-      const title = (info?.subject || `Группа №${num}`).replace(/\r?\n/g, ' ').trim();
-      const size = Number(info?.size || 0);
-      const onlyAdmins = Boolean(info?.announce || info?.isCommunityAnnounce);
-      const isRequest = Boolean(info?.joinApprovalMode || info?.membershipApprovalMode);
-
-      if (gid && myGroups.has(gid)) {
-        knownGroups.set(num, { canWrite: !onlyAdmins, onlyAdmins, isRequest, size, title, gid, shown: true });
         saveKnown();
-        await delay(SCAN_DELAY_MS);
-        continue;
+        updUi(`${isRequest ? '🟡 По запросу' : '🟢 Открытая'} №${num} (${size} уч.)`, true);
+        await sleep(SCAN_DELAY_MS);
+      } catch (err) {
+        const m = String(err?.message || err || '');
+        if (m.includes('401') || m.includes('404') || m.includes('410') || m.includes('gone') || m.includes('not-authorized') || m.includes('bad-request')) {
+          knownGroups.set(num, { dead: true });
+        }
+        dead++;
+        updUi(`Нерабочая №${num}`);
+        await sleep(SCAN_DELAY_MS);
       }
-      if (onlyAdmins) {
-        locked++;
-        knownGroups.set(num, { onlyAdmins: true, size, title, gid });
-        updUi(`Закрыта для писем №${num}`);
-        await delay(SCAN_DELAY_MS);
-        continue;
-      }
-      if (size < minMembers) {
-        small++;
-        knownGroups.set(num, { canWrite: true, onlyAdmins: false, isRequest, size, title, gid, shown: false });
-        updUi(`Мало людей №${num} (${size} уч.)`);
-        await delay(SCAN_DELAY_MS);
-        continue;
-      }
-
-      knownGroups.set(num, { canWrite: true, onlyAdmins: false, isRequest, size, title, gid, shown: true });
-      const item = { num, title, size, link: `https://chat.whatsapp.com/${code}` };
-      if (isRequest) foundRequest.push(item);
-      else foundOpen.push(item);
-      saveKnown();
-      updUi(`${isRequest ? '🟡 По запросу' : '🟢 Открытая'} №${num} (${size} уч.)`, true);
-      await delay(SCAN_DELAY_MS);
-    } catch (err) {
-      const m = String(err?.message || err || '');
-      if (m.includes('401') || m.includes('404') || m.includes('410') || m.includes('gone') || m.includes('not-authorized') || m.includes('bad-request')) {
-        knownGroups.set(num, { dead: true });
-      }
-      dead++;
-      updUi(`Нерабочая №${num}`);
-      await delay(SCAN_DELAY_MS);
     }
+  } finally {
+    saveKnown();
+    s.isSearching = false; s.stopSearch = false;
   }
-
-  saveKnown();
-  s.isSearching = false; s.stopSearch = false;
 
   if (!totalFound()) {
     return bot.sendMessage(chatId, `🏁 Поиск завершён. Новых групп (${minMembers}+ уч.) больше не найдено.`, getMainMenuKeyboard(chatId)).catch(() => {});
@@ -867,86 +891,177 @@ async function runGroupFinder(chatId, targetCount = 10, minMembers = 500) {
   ).catch(() => {});
 }
 
-async function broadcastMessage(chatId, s, targets) {
+function shortErr(e) {
+  const m = e?.output?.payload?.message || e?.message || String(e || 'unknown');
+  return String(m).replace(/\s+/g, ' ').slice(0, 70);
+}
+
+async function waitConnected(s, maxMs) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) {
+    if (s.stopBroadcast) return false;
+    if (s.isConnected && s.sock) return true;
+    if (s.isStopped) return false;
+    await sleep(1000);
+  }
+  return Boolean(s.isConnected && s.sock);
+}
+
+async function interruptibleSleep(s, ms) {
+  const steps = Math.ceil(ms / 1000);
+  for (let w = 0; w < steps; w++) {
+    if (s.stopBroadcast) return;
+    await sleep(1000);
+  }
+}
+
+function buildWaContent(draft, buf) {
+  const caption = draft.text && draft.text.trim() ? draft.text : undefined;
+  if (draft.type === 'photo') return { image: buf, caption };
+  if (draft.type === 'video') {
+    const c = { video: buf, caption, mimetype: draft.mime || 'video/mp4' };
+    if (draft.gif) c.gifPlayback = true;
+    return c;
+  }
+  return { text: draft.text };
+}
+
+async function sendToGroup(s, jid, content) {
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!(await waitConnected(s, 90000))) throw new Error('WhatsApp отключён');
+    try {
+      return await s.sock.sendMessage(jid, content);
+    } catch (e) {
+      lastErr = e;
+      const m = shortErr(e);
+      const transient = /rate-overlimit|timed out|timeout|connection closed|connection lost|428|408|stream errored/i.test(m);
+      if (!transient || attempt === 1) break;
+      await interruptibleSleep(s, 30000);
+      if (s.stopBroadcast) break;
+    }
+  }
+  throw lastErr;
+}
+
+async function broadcastMessage(chatId, s, target) {
   if (!s.sock || !s.isConnected) return bot.sendMessage(chatId, '❌ WhatsApp не подключен.').catch(() => {});
   if (s.isBroadcasting) {
     return bot.sendMessage(chatId, '⏳ Рассылка уже идёт!', {
       reply_markup: { inline_keyboard: [[{ text: '🛑 Остановить рассылку', callback_data: 'b_stop' }]] }
     }).catch(() => {});
   }
-  if (!targets.length) return bot.sendMessage(chatId, '⚠️ Нет групп для рассылки.').catch(() => {});
 
-  const { type, text, fileId } = s.draft;
-  if (type === 'text' && (!text || !text.trim())) return bot.sendMessage(chatId, '⚠️ Пустой текст.').catch(() => {});
+  const draft = { ...s.draft };
+  if (draft.type === 'text' && (!draft.text || !draft.text.trim())) return bot.sendMessage(chatId, '⚠️ Пустой текст.').catch(() => {});
+  if ((draft.type === 'photo' || draft.type === 'video') && !draft.fileId) return bot.sendMessage(chatId, '⚠️ Файл не найден, отправьте его заново.').catch(() => {});
 
   s.isBroadcasting = true;
   s.stopBroadcast = false;
-  let ok = 0, fail = 0, statusMsg = null;
   const stopKb = { inline_keyboard: [[{ text: '🛑 Остановить рассылку', callback_data: 'b_stop' }]] };
+  let ok = 0, fail = 0, closedCount = 0, aborted = '';
+  const reasons = new Map();
+  const failedNames = [];
+  let statusMsg = null;
 
   try {
+    try { await refreshGroupsCache(s); } catch (e) { console.error('refresh before broadcast', e.message); }
+
+    let pool = s.groupsCache;
+    if (target.mode === 'one') pool = pool.filter((g) => shortId(g.id) === target.sid);
+    else pool = pool.filter((g) => !s.excludedGroups.has(String(g.id)));
+
+    if (!pool.length) {
+      return await bot.sendMessage(chatId, '⚠️ Нет групп для рассылки.').catch(() => {});
+    }
+
+    const closedGroups = pool.filter((g) => g.closed);
+    let open = pool.filter((g) => !g.closed);
+    closedCount = closedGroups.length;
+
+    if (target.mode === 'rand') {
+      for (let i = open.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [open[i], open[j]] = [open[j], open[i]]; }
+      open = open.slice(0, target.n || 10);
+    }
+    open.sort((a, b) => (b.size - a.size) || a.subject.localeCompare(b.subject, 'ru'));
+
+    if (!open.length) {
+      return await bot.sendMessage(chatId, `⚠️ Нет подходящих групп: закрытых для писем — ${closedCount}.`).catch(() => {});
+    }
+
     statusMsg = await bot.sendMessage(
       chatId,
-      `⏳ Начинаю рассылку по ${targets.length} группам (КД 18 сек)...`,
+      `⏳ Начинаю рассылку: ${open.length} групп (сначала самые большие), закрытых пропущено: ${closedCount}.`,
       { reply_markup: stopKb }
     ).catch(() => null);
 
     let buf = null;
-    if ((type === 'photo' || type === 'video') && fileId) {
-      const link = await bot.getFileLink(fileId);
-      buf = await downloadBuffer(link);
+    if (draft.type === 'photo' || draft.type === 'video') {
+      try {
+        const link = await bot.getFileLink(draft.fileId);
+        buf = await downloadBuffer(link);
+      } catch (e) {
+        const big = /too big/i.test(String(e?.message));
+        await bot.sendMessage(chatId, big
+          ? '❌ Файл больше 20 МБ — Telegram не даёт боту его скачать. Сожмите видео и отправьте заново.'
+          : `❌ Не удалось скачать файл из Telegram: ${shortErr(e)}`).catch(() => {});
+        return;
+      }
     }
+    const content = buildWaContent(draft, buf);
 
-    for (let i = 0; i < targets.length; i++) {
+    for (let i = 0; i < open.length; i++) {
       if (s.stopBroadcast) break;
-      if (!s.isConnected || !s.sock) { fail += targets.length - i; break; }
-
-      const group = targets[i];
-
-      // Проверка перед отправкой: открыт ли чат для сообщений
-      try {
-        const meta = await s.sock.groupMetadata(group.id).catch(() => null);
-        if (meta && meta.announce === true) {
-          fail++;
-          continue;
-        }
-      } catch (_) {}
+      const g = open[i];
 
       try {
-        if (type === 'photo' && buf) await s.sock.sendMessage(group.id, { image: buf, caption: text || '' });
-        else if (type === 'video' && buf) await s.sock.sendMessage(group.id, { video: buf, caption: text || '' });
-        else await s.sock.sendMessage(group.id, { text: text || '' });
+        await sendToGroup(s, g.id, content);
         ok++;
-      } catch (_) {
-        fail++;
+      } catch (e) {
+        if (!s.isConnected && /отключён/.test(shortErr(e))) {
+          aborted = 'WhatsApp отключился';
+          break;
+        }
+        if (g.onlyAdminsWrite) {
+          closedCount++;
+        } else {
+          fail++;
+          const r = shortErr(e);
+          reasons.set(r, (reasons.get(r) || 0) + 1);
+          failedNames.push(safeTitle(g.subject, 25));
+        }
+        console.error('send fail', g.id, shortErr(e));
       }
 
-      if (statusMsg && (i % 2 === 0 || i === targets.length - 1)) {
+      if (statusMsg) {
         bot.editMessageText(
-          `📤 Идёт рассылка: ${i + 1} из ${targets.length}\n✅ Успешно: ${ok} | ❌ Ошибок/Закрыто: ${fail}`,
+          `📤 Рассылка: ${i + 1} из ${open.length}\n✅ Отправлено: ${ok} | ❌ Ошибок: ${fail}\n🔒 Закрытых пропущено: ${closedCount}\n➡️ Последняя: ${safeTitle(g.subject, 30)} (${g.size} уч.)`,
           { chat_id: chatId, message_id: statusMsg.message_id, reply_markup: stopKb }
         ).catch(() => {});
       }
 
-      if (i < targets.length - 1 && !s.stopBroadcast) {
-        const waitMs = BROADCAST_DELAY_MS + Math.floor(Math.random() * 2000);
-        const steps = Math.ceil(waitMs / 1000);
-        for (let w = 0; w < steps; w++) {
-          if (s.stopBroadcast || !s.isConnected || !s.sock) break;
-          await delay(1000);
-        }
+      if (i < open.length - 1 && !s.stopBroadcast) {
+        await interruptibleSleep(s, BROADCAST_DELAY_MS + Math.floor(Math.random() * 2000));
       }
     }
 
-    const wasStopped = s.stopBroadcast;
-    const res = `${wasStopped ? '🛑 Рассылка остановлена!' : '✅ Рассылка завершена!'}\n\n📤 Успешно: ${ok} из ${targets.length}\n❌ Ошибок/Закрыто: ${fail}`;
+    const head = aborted ? `⚠️ Рассылка прервана: ${aborted}` : s.stopBroadcast ? '🛑 Рассылка остановлена!' : '✅ Рассылка завершена!';
+    let res = `${head}\n\n📤 Отправлено: ${ok} из ${open.length}\n🔒 Пропущено закрытых: ${closedCount}\n❌ Ошибок: ${fail}`;
+    if (reasons.size) {
+      res += `\n\nПричины ошибок:\n` + [...reasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([r, c]) => `• ${r} — ${c}`).join('\n');
+    }
+    if (failedNames.length) {
+      res += `\n\nНе доставлено в: ${failedNames.slice(0, 15).join(', ')}${failedNames.length > 15 ? ` и ещё ${failedNames.length - 15}` : ''}`;
+    }
+    res = res.slice(0, 4000);
     if (statusMsg) {
       await bot.editMessageText(res, { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => bot.sendMessage(chatId, res).catch(() => {}));
     } else {
       await bot.sendMessage(chatId, res).catch(() => {});
     }
   } catch (e) {
-    await bot.sendMessage(chatId, `❌ Ошибка рассылки: ${e.message}`).catch(() => {});
+    console.error('broadcast', e);
+    await bot.sendMessage(chatId, `❌ Ошибка рассылки: ${shortErr(e)}`).catch(() => {});
   } finally {
     s.isBroadcasting = false;
     s.stopBroadcast = false;
@@ -955,7 +1070,9 @@ async function broadcastMessage(chatId, s, targets) {
 
 async function sendDraftPreview(chatId, s, msgId = null) {
   const h = s.draft.type === 'photo' ? '🖼 Фото сохранено!' : s.draft.type === 'video' ? '🎬 Видео сохранено!' : '📝 Текст сохранён!';
-  const txt = `${h}\n\n${s.draft.text || '(без подписи)'}\n\n👇 Выберите действие:`;
+  let body = s.draft.text || '(без подписи)';
+  if (body.length > 3000) body = body.slice(0, 3000) + '…';
+  const txt = `${h}\n\n${body}\n\n👇 Выберите действие:`;
   if (msgId) return bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, reply_markup: getBroadcastMenuKeyboard(s) }).catch(() => {});
   return bot.sendMessage(chatId, txt, { reply_markup: getBroadcastMenuKeyboard(s) }).catch(() => {});
 }
@@ -977,311 +1094,378 @@ bot.onText(/^\/start/, async (msg) => {
 
   let t = `👋 Панель управления WhatsApp\n\nСтатус: ${s.isConnected ? '🟢 Подключен' : '🔴 Не подключен'}\nГрупп: ${s.groupsCache.length} | Искл: ${s.excludedGroups.size}\nСлоты: ${Math.max(0, MAX_USERS - countConnectedClients())}/${MAX_USERS}\n`;
   if (isOwner(id)) t += `База ссылок: ${EMBEDDED_LINKS.length} шт.\n`;
-  t += `\nОтправьте текст, фото или видео для рассылки:`;
+  t += `\nОтправьте текст, фото или видео (с подписью) для рассылки:`;
   await bot.sendMessage(id, t, getMainMenuKeyboard(id)).catch(() => {});
 });
 
 bot.on('message', async (msg) => {
-  const id = Number(msg.chat.id);
-  const text = msg.text ? msg.text.trim() : '';
-  if (text.startsWith('/start')) return;
-  updateUserInfo(msg);
-  if (bannedUsers.has(id) && !isOwner(id)) return bot.sendMessage(id, '⛔ Доступ закрыт.').catch(() => {});
+  try {
+    const id = Number(msg.chat.id);
+    const text = msg.text ? msg.text.trim() : '';
+    if (text.startsWith('/start')) return;
+    updateUserInfo(msg);
+    if (bannedUsers.has(id) && !isOwner(id)) return bot.sendMessage(id, '⛔ Доступ закрыт.').catch(() => {});
 
-  const s = getUserSession(id);
+    const s = getUserSession(id);
 
-  if (MENU_BUTTONS.has(text)) {
-    s.step = 'IDLE';
-  }
+    if (MENU_BUTTONS.has(text)) s.step = 'IDLE';
 
-  if (text === '👑 Админ-панель' && isAdmin(id)) {
-    return bot.sendMessage(id, buildAdminText(id), { reply_markup: buildAdminKeyboard(id) }).catch(() => {});
-  }
-
-  if (text === '🔎 Найти группы') {
-    if (!isOwner(id)) return bot.sendMessage(id, '❌ Только для Создателя.').catch(() => {});
-    s.step = 'AWAITING_FINDER_PARAMS';
-    return bot.sendMessage(id, buildFinderPanelText(), { reply_markup: getFinderKeyboard(s) }).catch(() => {});
-  }
-
-  if (text === 'Войти в аккаунт') {
-    if (s.isConnected) return bot.sendMessage(id, '🟢 Уже подключен!', getMainMenuKeyboard(id)).catch(() => {});
-    if (!isAdmin(id) && countConnectedClients() >= MAX_USERS && !fs.existsSync(getUserAuthDir(id))) {
-      return bot.sendMessage(id, `⚠️ Все слоты заняты (${MAX_USERS}/${MAX_USERS}).`).catch(() => {});
+    if (text === '👑 Админ-панель') {
+      if (!isAdmin(id)) return;
+      const v = buildAdminView(id, 0);
+      return bot.sendMessage(id, v.text, { reply_markup: v.reply_markup }).catch(() => {});
     }
-    s.step = 'AWAITING_PHONE';
-    return bot.sendMessage(id, '📱 Введите номер WhatsApp начиная с 7 (например: 79298892099):', {
-      reply_markup: { inline_keyboard: [[{ text: '📷 Войти по QR-коду', callback_data: 'force_qr' }]] }
-    }).catch(() => {});
-  }
 
-  if (text === 'Список групп') {
-    if (!s.isConnected) return bot.sendMessage(id, '🔴 WhatsApp не подключен.').catch(() => {});
-    await ensureGroupsLoaded(id, s);
-    if (!s.groupsCache.length) return bot.sendMessage(id, '📭 Групп нет.').catch(() => {});
-    let chunk = `📋 Ваши группы (${s.groupsCache.length}):\n\n`;
-    for (let i = 0; i < s.groupsCache.length; i++) {
-      const g = s.groupsCache[i];
-      const line = `${i + 1}. ${g.subject}${s.excludedGroups.has(String(g.id)) ? ' 🚫' : ''}\n`;
-      if ((chunk + line).length > 3800) { await bot.sendMessage(id, chunk).catch(() => {}); chunk = ''; }
-      chunk += line;
+    if (text === '🔎 Найти группы') {
+      if (!isOwner(id)) return bot.sendMessage(id, '❌ Только для Создателя.').catch(() => {});
+      s.step = 'AWAITING_FINDER_PARAMS';
+      return bot.sendMessage(id, buildFinderPanelText(), { reply_markup: getFinderKeyboard(s) }).catch(() => {});
     }
-    if (chunk) await bot.sendMessage(id, chunk).catch(() => {});
-    return;
-  }
 
-  if (text === 'Обновить список групп') {
-    if (!s.isConnected) return bot.sendMessage(id, '🔴 WhatsApp не подключен.').catch(() => {});
-    const w = await bot.sendMessage(id, '🔄 Обновляю...').catch(() => null);
-    try {
-      await refreshGroupsCache(s);
-      if (w) await bot.editMessageText(`✅ Обновлено! Групп: ${s.groupsCache.length}`, { chat_id: id, message_id: w.message_id }).catch(() => {});
-    } catch (e) {
-      if (w) await bot.editMessageText(`❌ Ошибка: ${e.message}`, { chat_id: id, message_id: w.message_id }).catch(() => {});
+    if (text === '📦 Выгрузить мои группы') {
+      if (!s.isConnected) return bot.sendMessage(id, '🔴 Сначала подключите WhatsApp.').catch(() => {});
+      return bot.sendMessage(
+        id,
+        `📦 <b>Экспорт списка ваших групп</b>\n\n` +
+        `Бот соберёт названия, количество участников, статусы и доступные ссылки-приглашения ваших групп в один <code>.txt</code> файл и отправит его вам.\n\n` +
+        `Подтвердите действие:`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '✅ Да, выгрузить в .txt', callback_data: 'export_confirm' }],
+              [{ text: '❌ Отмена', callback_data: 'export_cancel' }]
+            ]
+          }
+        }
+      ).catch(() => {});
     }
-    return;
-  }
 
-  if (text === 'Список исключение' || text === 'Список исключений') {
-    if (!s.isConnected) return bot.sendMessage(id, '🔴 Сначала подключите WhatsApp.').catch(() => {});
-    await ensureGroupsLoaded(id, s);
-    if (!s.groupsCache.length) return bot.sendMessage(id, '📭 Групп нет.').catch(() => {});
-    return renderExclusionsMenu(id, s, 0, 'm', false, null, '');
-  }
-
-  if (text === 'Выйти из ватсап') {
-    s.stopBroadcast = true;
-    s.wasEverConnected = false;
-    if (s.sock) { try { await s.sock.logout().catch(() => {}); } catch (_) {} }
-    destroySocket(s);
-    clearUserAuthFolder(id);
-    s.groupsCache = [];
-    return bot.sendMessage(id, '👋 Сессия удалена.', getMainMenuKeyboard(id)).catch(() => {});
-  }
-
-  if (s.step === 'AWAITING_EXCL_SEARCH' && text) {
-    s.step = 'IDLE';
-    await ensureGroupsLoaded(id, s);
-    return renderExclusionsMenu(id, s, 0, s.exclState?.mode || 'm', false, null, text);
-  }
-
-  if (isAdmin(id) && s.step === 'AWAITING_ADMIN_BROADCAST' && text) {
-    s.step = 'IDLE';
-    if (text.toLowerCase() === 'отмена') return bot.sendMessage(id, '❌ Отменено.', getMainMenuKeyboard(id)).catch(() => {});
-    let sent = 0;
-    for (const uid of getVisibleUserIds(id)) {
-      if (!bannedUsers.has(uid)) {
-        try { await bot.sendMessage(uid, `📢 Сообщение от админа:\n\n${text}`); sent++; } catch (_) {}
+    if (text === 'Войти в аккаунт') {
+      if (s.isConnected) return bot.sendMessage(id, '🟢 Уже подключен!', getMainMenuKeyboard(id)).catch(() => {});
+      if (!isAdmin(id) && countConnectedClients() >= MAX_USERS && !fs.existsSync(getUserAuthDir(id))) {
+        return bot.sendMessage(id, `⚠️ Все слоты заняты (${MAX_USERS}/${MAX_USERS}).`).catch(() => {});
       }
+      s.step = 'AWAITING_PHONE';
+      return bot.sendMessage(id, '📱 Введите номер WhatsApp начиная с 7 (например: 79298892099):', {
+        reply_markup: { inline_keyboard: [[{ text: '📷 Войти по QR-коду', callback_data: 'force_qr' }]] }
+      }).catch(() => {});
     }
-    return bot.sendMessage(id, `✅ Доставлено: ${sent}`, getMainMenuKeyboard(id)).catch(() => {});
-  }
 
-  if (s.step === 'AWAITING_FINDER_PARAMS' && text) {
-    if (!isOwner(id)) { s.step = 'IDLE'; return; }
-    const nums = text.match(/\d+/g);
-    if (!nums || !nums.length) return bot.sendMessage(id, '⚠️ Введи два числа через пробел, например: 10 500').catch(() => {});
-    const count = Math.max(1, Math.min(100, parseInt(nums[0], 10)));
-    const minMem = nums.length >= 2 ? Math.max(1, parseInt(nums[1], 10)) : 500;
-    s.step = 'IDLE';
-    return runGroupFinder(id, count, minMem);
-  }
+    if (text === 'Список групп') {
+      if (!s.isConnected) return bot.sendMessage(id, '🔴 WhatsApp не подключен.').catch(() => {});
+      await ensureGroupsLoaded(id, s);
+      if (!s.groupsCache.length) return bot.sendMessage(id, '📭 Групп нет.').catch(() => {});
+      let chunk = `📋 Ваши группы (${s.groupsCache.length}), по числу участников:\n🚫 — исключена, 🔒 — закрыта для писем\n\n`;
+      for (let i = 0; i < s.groupsCache.length; i++) {
+        const g = s.groupsCache[i];
+        const line = `${i + 1}. ${g.subject} (${g.size})${s.excludedGroups.has(String(g.id)) ? ' 🚫' : ''}${g.closed ? ' 🔒' : ''}\n`;
+        if ((chunk + line).length > 3800) { await bot.sendMessage(id, chunk).catch(() => {}); chunk = ''; }
+        chunk += line;
+      }
+      if (chunk) await bot.sendMessage(id, chunk).catch(() => {});
+      return;
+    }
 
-  if (s.step === 'AWAITING_PHONE' && text) {
-    let ph = text.replace(/\D/g, '');
-    if (ph.length === 11 && ph.startsWith('8')) ph = '7' + ph.slice(1);
-    if (ph.length < 10 || ph.length > 15) return bot.sendMessage(id, '⚠️ Введите корректный номер начиная с 7 (например: 79298892099):').catch(() => {});
-    s.step = 'IDLE';
-    await bot.sendMessage(id, `⏳ Запрашиваю код для +${ph}...`).catch(() => {});
-    return startWhatsAppSession(id, { reset: true, phoneNumber: ph, forceQr: false });
-  }
+    if (text === 'Обновить список групп') {
+      if (!s.isConnected) return bot.sendMessage(id, '🔴 WhatsApp не подключен.').catch(() => {});
+      const w = await bot.sendMessage(id, '🔄 Обновляю и подтягиваю названия...').catch(() => null);
+      try {
+        await refreshGroupsCache(s);
+        if (w) await bot.editMessageText(`✅ Обновлено! Групп: ${s.groupsCache.length}`, { chat_id: id, message_id: w.message_id }).catch(() => {});
+      } catch (e) {
+        if (w) await bot.editMessageText(`❌ Ошибка: ${e.message}`, { chat_id: id, message_id: w.message_id }).catch(() => {});
+      }
+      return;
+    }
 
-  if (!s.isConnected) return bot.sendMessage(id, '⚠️ Сначала подключите WhatsApp.', getMainMenuKeyboard(id)).catch(() => {});
-  await ensureGroupsLoaded(id, s);
+    if (text === 'Список исключение' || text === 'Список исключений') {
+      if (!s.isConnected) return bot.sendMessage(id, '🔴 Сначала подключите WhatsApp.').catch(() => {});
+      await ensureGroupsLoaded(id, s);
+      if (!s.groupsCache.length) return bot.sendMessage(id, '📭 Групп нет.').catch(() => {});
+      return renderExclusionsMenu(id, s, { mode: 'm', onlyExcl: false, query: '', page: 0, msgId: null });
+    }
 
-  if (msg.photo?.length) {
-    s.draft = { type: 'photo', fileId: msg.photo[msg.photo.length - 1].file_id, text: msg.caption || '' };
+    if (text === 'Выйти из ватсап') {
+      s.stopBroadcast = true;
+      s.wasEverConnected = false;
+      if (s.sock) { try { await s.sock.logout().catch(() => {}); } catch (_) {} }
+      destroySocket(s);
+      clearUserAuthFolder(id);
+      s.groupsCache = [];
+      return bot.sendMessage(id, '👋 Сессия удалена.', getMainMenuKeyboard(id)).catch(() => {});
+    }
+
+    if (s.step === 'AWAITING_EXCL_SEARCH' && text) {
+      s.step = 'IDLE';
+      await ensureGroupsLoaded(id, s);
+      return renderExclusionsMenu(id, s, { query: text, page: 0 });
+    }
+
+    if (s.step === 'AWAITING_ADMIN_BROADCAST' && text) {
+      s.step = 'IDLE';
+      if (!isAdmin(id)) return;
+      if (text.toLowerCase() === 'отмена') return bot.sendMessage(id, '❌ Отменено.', getMainMenuKeyboard(id)).catch(() => {});
+      let sent = 0;
+      for (const uid of getVisibleUserIds(id)) {
+        if (!bannedUsers.has(uid)) {
+          try { await bot.sendMessage(uid, `📢 Сообщение от админа:\n\n${text}`); sent++; } catch (_) {}
+          await sleep(60);
+        }
+      }
+      return bot.sendMessage(id, `✅ Доставлено: ${sent}`, getMainMenuKeyboard(id)).catch(() => {});
+    }
+
+    if (s.step === 'AWAITING_FINDER_PARAMS' && text) {
+      if (!isOwner(id)) { s.step = 'IDLE'; return; }
+      const nums = text.match(/\d+/g);
+      if (!nums || !nums.length) return bot.sendMessage(id, '⚠️ Введи два числа через пробел, например: 10 500').catch(() => {});
+      const count = Math.max(1, Math.min(100, parseInt(nums[0], 10)));
+      const minMem = nums.length >= 2 ? Math.max(1, parseInt(nums[1], 10)) : 500;
+      s.step = 'IDLE';
+      return runGroupFinder(id, count, minMem);
+    }
+
+    if (s.step === 'AWAITING_PHONE' && text) {
+      let ph = text.replace(/\D/g, '');
+      if (ph.length === 11 && ph.startsWith('8')) ph = '7' + ph.slice(1);
+      if (ph.length < 10 || ph.length > 15) return bot.sendMessage(id, '⚠️ Введите корректный номер начиная с 7 (например: 79298892099):').catch(() => {});
+      s.step = 'IDLE';
+      await bot.sendMessage(id, `⏳ Запрашиваю код для +${ph}...`).catch(() => {});
+      return startWhatsAppSession(id, { reset: true, phoneNumber: ph, forceQr: false });
+    }
+
+    let draft = null;
+    let fileSize = 0;
+    if (msg.photo?.length) {
+      const ph = msg.photo[msg.photo.length - 1];
+      draft = { type: 'photo', fileId: ph.file_id, text: msg.caption || '' };
+      fileSize = ph.file_size || 0;
+    } else if (msg.video) {
+      draft = { type: 'video', fileId: msg.video.file_id, text: msg.caption || '', mime: msg.video.mime_type || 'video/mp4' };
+      fileSize = msg.video.file_size || 0;
+    } else if (msg.animation) {
+      draft = { type: 'video', fileId: msg.animation.file_id, text: msg.caption || '', mime: msg.animation.mime_type || 'video/mp4', gif: true };
+      fileSize = msg.animation.file_size || 0;
+    } else if (msg.document && /^video\//.test(msg.document.mime_type || '')) {
+      draft = { type: 'video', fileId: msg.document.file_id, text: msg.caption || '', mime: msg.document.mime_type };
+      fileSize = msg.document.file_size || 0;
+    } else if (msg.document && /^image\//.test(msg.document.mime_type || '')) {
+      draft = { type: 'photo', fileId: msg.document.file_id, text: msg.caption || '' };
+      fileSize = msg.document.file_size || 0;
+    } else if (text) {
+      draft = { type: 'text', fileId: null, text };
+    }
+    if (!draft) return;
+
+    if (!s.isConnected) return bot.sendMessage(id, '⚠️ Сначала подключите WhatsApp.', getMainMenuKeyboard(id)).catch(() => {});
+    if (fileSize > TG_FILE_LIMIT) {
+      return bot.sendMessage(id, '⚠️ Файл больше 20 МБ — Telegram не даёт боту такие файлы скачивать. Сожмите видео и отправьте заново.').catch(() => {});
+    }
+    await ensureGroupsLoaded(id, s);
+    s.draft = draft;
     return sendDraftPreview(id, s);
-  }
-  if (msg.video) {
-    s.draft = { type: 'video', fileId: msg.video.file_id, text: msg.caption || '' };
-    return sendDraftPreview(id, s);
-  }
-  if (text) {
-    s.draft = { type: 'text', fileId: null, text };
-    return sendDraftPreview(id, s);
+  } catch (e) {
+    console.error('message handler', e);
   }
 });
 
 bot.on('callback_query', async (q) => {
-  if (!q.message) return bot.answerCallbackQuery(q.id).catch(() => {});
-  const id = Number(q.message.chat.id);
-  const msgId = q.message.message_id;
-  const data = q.data || '';
+  try {
+    if (!q.message) return bot.answerCallbackQuery(q.id).catch(() => {});
+    const id = Number(q.message.chat.id);
+    const msgId = q.message.message_id;
+    const data = q.data || '';
+    const ack = (opts) => bot.answerCallbackQuery(q.id, opts).catch(() => {});
 
-  if (bannedUsers.has(id) && !isOwner(id)) {
-    return bot.answerCallbackQuery(q.id, { text: 'Доступ закрыт.', show_alert: true }).catch(() => {});
-  }
+    if (bannedUsers.has(id) && !isOwner(id)) return ack({ text: 'Доступ закрыт.', show_alert: true });
 
-  const s = getUserSession(id);
-  if (data === 'noop') return bot.answerCallbackQuery(q.id).catch(() => {});
+    const s = getUserSession(id);
+    if (data === 'noop') return ack();
 
-  if (data.startsWith('copy_code:')) {
-    const code = data.split(':')[1] || s.lastPairingCode || '';
-    await bot.answerCallbackQuery(q.id, { text: 'Скопируйте код из сообщения ниже' }).catch(() => {});
-    return bot.sendMessage(id, `<code>${code}</code>`, { parse_mode: 'HTML' }).catch(() => {});
-  }
-
-  if (data === 'b_stop') {
-    if (s.isBroadcasting) {
-      s.stopBroadcast = true;
-      return bot.answerCallbackQuery(q.id, { text: '🛑 Останавливаю рассылку...' }).catch(() => {});
+    if (data === 'export_confirm') {
+      await ack({ text: 'Запускаю выгрузку...' });
+      await bot.deleteMessage(id, msgId).catch(() => {});
+      return exportUserGroupsReport(id, s);
     }
-    return bot.answerCallbackQuery(q.id, { text: 'Рассылка уже завершена' }).catch(() => {});
-  }
 
-  if (data === 'f_stop') {
-    if (!isOwner(id)) return;
-    s.stopSearch = true;
-    return bot.answerCallbackQuery(q.id, { text: '🛑 Останавливаю поиск...' }).catch(() => {});
-  }
-  if (data.startsWith('f_run:')) {
-    if (!isOwner(id)) return;
-    const [, c, m] = data.split(':');
-    await bot.answerCallbackQuery(q.id).catch(() => {});
-    return runGroupFinder(id, parseInt(c, 10) || 10, parseInt(m, 10) || 500);
-  }
-  if (data === 'f_reset_shown') {
-    if (!isOwner(id)) return;
-    for (const [k, v] of knownGroups.entries()) {
-      if (v.shown) { v.shown = false; knownGroups.set(k, v); }
+    if (data === 'export_cancel') {
+      await ack({ text: 'Отменено' });
+      return bot.editMessageText('❌ Выгрузка отменена.', { chat_id: id, message_id: msgId }).catch(() => {});
     }
-    saveKnown();
-    await bot.answerCallbackQuery(q.id, { text: 'История показанных сброшена!' }).catch(() => {});
-    return bot.editMessageText(buildFinderPanelText(), { chat_id: id, message_id: msgId, reply_markup: getFinderKeyboard(s) }).catch(() => {});
-  }
 
-  if (data.startsWith('adm_') && isAdmin(id)) {
-    if (data === 'adm_refresh') {
-      await bot.answerCallbackQuery(q.id).catch(() => {});
-      return bot.editMessageText(buildAdminText(id), { chat_id: id, message_id: msgId, reply_markup: buildAdminKeyboard(id) }).catch(() => {});
+    if (data.startsWith('copy_code:')) {
+      const code = data.split(':')[1] || s.lastPairingCode || '';
+      await ack({ text: 'Скопируйте код из сообщения ниже' });
+      return bot.sendMessage(id, `<code>${code}</code>`, { parse_mode: 'HTML' }).catch(() => {});
     }
-    if (data === 'adm_msg_all') {
-      s.step = 'AWAITING_ADMIN_BROADCAST';
-      await bot.answerCallbackQuery(q.id).catch(() => {});
-      return bot.sendMessage(id, '📢 Введите сообщение для всех клиентов (или напишите Отмена):').catch(() => {});
-    }
-    const [act, tidStr] = data.split(':');
-    const tid = Number(tidStr);
-    if (isOwner(tid) || (!isOwner(id) && isSubAdmin(tid))) {
-      return bot.answerCallbackQuery(q.id, { text: '⛔ Нет прав!', show_alert: true }).catch(() => {});
-    }
-    const ts = sessions.get(tid);
-    if (act === 'adm_stopbc') {
-      if (ts && ts.isBroadcasting) {
-        ts.stopBroadcast = true;
-        bot.sendMessage(tid, '🛑 Администратор остановил вашу рассылку.').catch(() => {});
+
+    if (data === 'b_stop') {
+      if (s.isBroadcasting) {
+        s.stopBroadcast = true;
+        return ack({ text: '🛑 Останавливаю рассылку...' });
       }
-      await bot.answerCallbackQuery(q.id, { text: 'Рассылка остановлена' }).catch(() => {});
-      return bot.editMessageText(buildAdminText(id), { chat_id: id, message_id: msgId, reply_markup: buildAdminKeyboard(id) }).catch(() => {});
+      return ack({ text: 'Рассылка уже завершена' });
     }
-    if (act === 'adm_kick' || act === 'adm_ban' || act === 'adm_reset' || act === 'adm_del') {
-      if (ts) {
-        ts.stopBroadcast = true;
-        ts.wasEverConnected = false;
-        if (ts.sock && act !== 'adm_reset') { try { await ts.sock.logout().catch(() => {}); } catch (_) {} }
-        destroySocket(ts);
-        ts.groupsCache = [];
+
+    if (data === 'f_stop' || data.startsWith('f_run:') || data === 'f_reset_shown') {
+      if (!isOwner(id)) return ack({ text: '⛔ Только для Создателя', show_alert: true });
+      if (data === 'f_stop') {
+        s.stopSearch = true;
+        return ack({ text: '🛑 Останавливаю поиск...' });
       }
-      clearUserAuthFolder(tid);
+      if (data.startsWith('f_run:')) {
+        const [, c, m] = data.split(':');
+        await ack();
+        return runGroupFinder(id, parseInt(c, 10) || 10, parseInt(m, 10) || 500);
+      }
+      for (const [k, v] of knownGroups.entries()) {
+        if (v.shown) { v.shown = false; knownGroups.set(k, v); }
+      }
+      saveKnown();
+      await ack({ text: 'История показанных сброшена!' });
+      return bot.editMessageText(buildFinderPanelText(), { chat_id: id, message_id: msgId, reply_markup: getFinderKeyboard(s) }).catch(() => {});
     }
-    if (act === 'adm_ban') { bannedUsers.add(tid); saveBanned(); bot.sendMessage(tid, '⛔ Доступ закрыт.').catch(() => {}); }
-    if (act === 'adm_unban') { bannedUsers.delete(tid); saveBanned(); bot.sendMessage(tid, '✅ Доступ открыт! /start').catch(() => {}); }
-    if (act === 'adm_del') { sessions.delete(tid); bannedUsers.delete(tid); usersMeta.delete(tid); saveBanned(); saveUsersMeta(); }
-    await bot.answerCallbackQuery(q.id, { text: 'Готово' }).catch(() => {});
-    return bot.editMessageText(buildAdminText(id), { chat_id: id, message_id: msgId, reply_markup: buildAdminKeyboard(id) }).catch(() => {});
-  }
 
-  if (data === 'force_qr') {
-    s.step = 'IDLE';
-    await bot.answerCallbackQuery(q.id).catch(() => {});
-    return startWhatsAppSession(id, { reset: true, phoneNumber: null, forceQr: true });
-  }
+    if (data.startsWith('adm_')) {
+      if (!isAdmin(id)) return ack({ text: '⛔ Нет прав!', show_alert: true });
 
-  await ensureGroupsLoaded(id, s);
+      const show = (page) => {
+        const v = buildAdminView(id, page);
+        return bot.editMessageText(v.text, { chat_id: id, message_id: msgId, reply_markup: v.reply_markup }).catch(() => {});
+      };
 
-  if (data === 'b_back') {
-    await bot.answerCallbackQuery(q.id).catch(() => {});
-    return sendDraftPreview(id, s, msgId);
-  }
-  if (data.startsWith('b_one_page:')) {
-    const p = parseInt(data.split(':')[1], 10) || 0;
-    await bot.answerCallbackQuery(q.id).catch(() => {});
-    return bot.editMessageText(`🎯 Выберите группу (Стр. ${p + 1}):`, {
-      chat_id: id,
-      message_id: msgId,
-      reply_markup: buildSingleGroupKeyboard(s, p)
-    }).catch(() => {});
-  }
-  if (data.startsWith('send_one:')) {
-    const g = s.groupsCache[parseInt(data.split(':')[1], 10)];
-    if (!g) return bot.answerCallbackQuery(q.id, { text: 'Не найдена', show_alert: true }).catch(() => {});
-    await bot.answerCallbackQuery(q.id).catch(() => {});
-    return broadcastMessage(id, s, [g]);
-  }
-  if (data === 'b_rand10') {
-    const av = s.groupsCache.filter((g) => !s.excludedGroups.has(String(g.id)));
-    for (let i = av.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [av[i], av[j]] = [av[j], av[i]]; }
-    await bot.answerCallbackQuery(q.id).catch(() => {});
-    return broadcastMessage(id, s, av.slice(0, 10));
-  }
-  if (data === 'b_all') {
-    const av = s.groupsCache.filter((g) => !s.excludedGroups.has(String(g.id)));
-    await bot.answerCallbackQuery(q.id).catch(() => {});
-    return broadcastMessage(id, s, av);
-  }
-  if (data.startsWith('excl_search:')) {
-    const mode = data.split(':')[1] || 'm';
-    s.step = 'AWAITING_EXCL_SEARCH';
-    s.exclState = { mode, onlyExcl: false, query: '', msgId };
-    await bot.answerCallbackQuery(q.id).catch(() => {});
-    return bot.sendMessage(id, '🔍 Напишите часть названия группы, которую нужно найти для исключения:').catch(() => {});
-  }
-  if (data.startsWith('excl_open:')) {
-    const parts = data.split(':');
-    const p = parseInt(parts[1], 10) || 0;
-    const m = parts[2] || 'm';
-    const oe = parts[3] === '1';
-    await bot.answerCallbackQuery(q.id).catch(() => {});
-    return renderExclusionsMenu(id, s, p, m, oe, msgId, '');
-  }
-  if (data.startsWith('excl_tog:')) {
-    const parts = data.split(':');
-    const idx = parseInt(parts[1], 10);
-    const p = parseInt(parts[2], 10) || 0;
-    const m = parts[3] || 'm';
-    const oe = parts[4] === '1';
-    const g = s.groupsCache[idx];
-    if (!g) return bot.answerCallbackQuery(q.id, { text: 'Обновите список групп' }).catch(() => {});
-    const gid = String(g.id);
-    if (s.excludedGroups.has(gid)) {
-      s.excludedGroups.delete(gid);
-      await bot.answerCallbackQuery(q.id, { text: '✅ Возвращена в рассылку' }).catch(() => {});
-    } else {
-      s.excludedGroups.add(gid);
-      await bot.answerCallbackQuery(q.id, { text: '🚫 Добавлена в исключения' }).catch(() => {});
+      if (data.startsWith('adm_pg:')) {
+        await ack();
+        return show(parseInt(data.split(':')[1], 10) || 0);
+      }
+      if (data === 'adm_msg_all') {
+        s.step = 'AWAITING_ADMIN_BROADCAST';
+        await ack();
+        return bot.sendMessage(id, '📢 Введите сообщение для всех клиентов (или напишите Отмена):').catch(() => {});
+      }
+
+      const [act, tidStr, pageStr] = data.split(':');
+      const tid = Number(tidStr);
+      const page = parseInt(pageStr, 10) || 0;
+      if (!tid || tid === id || isOwner(tid) || (!isOwner(id) && isSubAdmin(tid))) {
+        return ack({ text: '⛔ Нет прав!', show_alert: true });
+      }
+      const ts = sessions.get(tid);
+
+      if (act === 'adm_stopbc') {
+        if (ts && ts.isBroadcasting) {
+          ts.stopBroadcast = true;
+          bot.sendMessage(tid, '🛑 Администратор остановил вашу рассылку.').catch(() => {});
+        }
+        await ack({ text: 'Рассылка остановлена' });
+        return show(page);
+      }
+
+      if (act === 'adm_kick' || act === 'adm_ban' || act === 'adm_reset' || act === 'adm_del') {
+        if (ts) {
+          ts.stopBroadcast = true;
+          ts.wasEverConnected = false;
+          if (ts.sock && act !== 'adm_reset') { try { await ts.sock.logout().catch(() => {}); } catch (_) {} }
+          destroySocket(ts);
+          ts.groupsCache = [];
+        }
+        clearUserAuthFolder(tid);
+      }
+      if (act === 'adm_ban') { bannedUsers.add(tid); saveBanned(); bot.sendMessage(tid, '⛔ Доступ закрыт.').catch(() => {}); }
+      if (act === 'adm_unban') { bannedUsers.delete(tid); saveBanned(); bot.sendMessage(tid, '✅ Доступ открыт! /start').catch(() => {}); }
+      if (act === 'adm_del') {
+        sessions.delete(tid); bannedUsers.delete(tid); usersMeta.delete(tid);
+        saveBanned(); saveUsersMeta();
+        try { fs.rmSync(getUserExclPath(tid), { force: true }); } catch (_) {}
+      }
+      await ack({ text: 'Готово' });
+      return show(page);
     }
-    saveExcluded(id, s);
-    return renderExclusionsMenu(id, s, p, m, oe, msgId, s.exclState?.query || '');
-  }
-  if (data.startsWith('excl_clear:')) {
-    const parts = data.split(':');
-    const p = parseInt(parts[1], 10) || 0;
-    const m = parts[2] || 'm';
-    s.excludedGroups.clear();
-    saveExcluded(id, s);
-    await bot.answerCallbackQuery(q.id, { text: '✅ Все исключения очищены!' }).catch(() => {});
-    return renderExclusionsMenu(id, s, p, m, false, msgId, '');
+
+    if (data === 'force_qr') {
+      s.step = 'IDLE';
+      await ack();
+      return startWhatsAppSession(id, { reset: true, phoneNumber: null, forceQr: true });
+    }
+
+    await ensureGroupsLoaded(id, s);
+
+    if (data === 'b_back') {
+      await ack();
+      return sendDraftPreview(id, s, msgId);
+    }
+    if (data.startsWith('b_one_page:')) {
+      const p = parseInt(data.split(':')[1], 10) || 0;
+      await ack();
+      return bot.editMessageText(`🎯 Выберите группу (Стр. ${p + 1}), 🔒 — закрыта для писем:`, {
+        chat_id: id,
+        message_id: msgId,
+        reply_markup: buildSingleGroupKeyboard(s, p)
+      }).catch(() => {});
+    }
+    if (data.startsWith('send_one:')) {
+      const sid = data.slice('send_one:'.length);
+      if (!findGroupByShort(s, sid)) return ack({ text: 'Группа не найдена, обновите список', show_alert: true });
+      await ack();
+      return broadcastMessage(id, s, { mode: 'one', sid });
+    }
+    if (data === 'b_rand10') {
+      await ack();
+      return broadcastMessage(id, s, { mode: 'rand', n: 10 });
+    }
+    if (data === 'b_all') {
+      await ack();
+      return broadcastMessage(id, s, { mode: 'all' });
+    }
+
+    if (data.startsWith('excl_open:')) {
+      await ack();
+      const mode = data.split(':')[1] === 'b' ? 'b' : 'm';
+      return renderExclusionsMenu(id, s, { mode, onlyExcl: false, query: '', page: 0, msgId });
+    }
+    if (data.startsWith('excl_pg:')) {
+      await ack();
+      return renderExclusionsMenu(id, s, { page: parseInt(data.split(':')[1], 10) || 0, msgId });
+    }
+    if (data === 'excl_search') {
+      s.step = 'AWAITING_EXCL_SEARCH';
+      s.exclState = { ...s.exclState, msgId };
+      await ack();
+      return bot.sendMessage(id, '🔍 Напишите часть названия группы, которую нужно найти:').catch(() => {});
+    }
+    if (data === 'excl_rq') {
+      await ack();
+      return renderExclusionsMenu(id, s, { query: '', page: 0, msgId });
+    }
+    if (data.startsWith('excl_flt:')) {
+      await ack();
+      return renderExclusionsMenu(id, s, { onlyExcl: data.split(':')[1] === '1', page: 0, msgId });
+    }
+    if (data.startsWith('excl_tog:')) {
+      const g = findGroupByShort(s, data.slice('excl_tog:'.length));
+      if (!g) return ack({ text: 'Группа не найдена, обновите список групп', show_alert: true });
+      const gid = String(g.id);
+      if (s.excludedGroups.has(gid)) {
+        s.excludedGroups.delete(gid);
+        await ack({ text: '✅ Возвращена в рассылку' });
+      } else {
+        s.excludedGroups.add(gid);
+        await ack({ text: '🚫 Добавлена в исключения' });
+      }
+      saveExcluded(id, s);
+      return renderExclusionsMenu(id, s, { msgId });
+    }
+    if (data === 'excl_clear') {
+      s.excludedGroups.clear();
+      saveExcluded(id, s);
+      await ack({ text: '✅ Все исключения очищены!' });
+      return renderExclusionsMenu(id, s, { onlyExcl: false, page: 0, msgId });
+    }
+
+    return ack();
+  } catch (e) {
+    console.error('callback handler', e);
   }
 });
 
@@ -1289,16 +1473,17 @@ bot.on('callback_query', async (q) => {
   await startPolling();
   try {
     for (const f of fs.readdirSync(__dirname)) {
-      if (f.startsWith('auth_info_')) {
-        const id = Number(f.replace('auth_info_', ''));
-        const cf = path.join(__dirname, f, 'creds.json');
-        if (id && (!bannedUsers.has(id) || isOwner(id)) && fs.existsSync(cf)) {
-          try {
-            if (JSON.parse(fs.readFileSync(cf, 'utf-8'))?.registered) startWhatsAppSession(id, { reset: false });
-            else clearUserAuthFolder(id);
-          } catch (_) { clearUserAuthFolder(id); }
-        }
+      if (!f.startsWith('auth_info_')) continue;
+      const id = Number(f.replace('auth_info_', ''));
+      const cf = path.join(__dirname, f, 'creds.json');
+      if (id && (!bannedUsers.has(id) || isOwner(id)) && fs.existsSync(cf)) {
+        try {
+          if (JSON.parse(fs.readFileSync(cf, 'utf-8'))?.registered) {
+            startWhatsAppSession(id, { reset: false });
+            await sleep(1500);
+          } else clearUserAuthFolder(id);
+        } catch (_) { clearUserAuthFolder(id); }
       }
     }
-  } catch (_) {}
+  } catch (e) { console.error('restore sessions', e.message); }
 })();
